@@ -1,6 +1,8 @@
 from datetime import datetime, date
 from typing import Optional, List
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from database import engine, get_db, Base
@@ -22,7 +24,7 @@ from analytics import (
     get_all_alerts, get_turnover_distribution,
     get_abnormal_areas, get_pending_review_records
 )
-from exceptions import NotFoundException
+from exceptions import NotFoundException, ValidationException
 
 Base.metadata.create_all(bind=engine)
 
@@ -33,7 +35,35 @@ app = FastAPI(
 )
 
 
-def parse_datetime_param(value: Optional[str]) -> Optional[datetime]:
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    if errors:
+        first_error = errors[0]
+        loc = first_error.get("loc", [])
+        field = ".".join(str(x) for x in loc if x != "body") if loc else None
+        msg = first_error.get("msg", "参数校验失败")
+        if field and field != "":
+            message = f"{field}: {msg}"
+        else:
+            message = msg
+    else:
+        message = "参数校验失败"
+        field = None
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error_type": "validation_error",
+                "message": message,
+                "field": field
+            }
+        }
+    )
+
+
+def parse_datetime_param(value: Optional[str], field_name: str = "date") -> Optional[datetime]:
     if not value:
         return None
     try:
@@ -41,7 +71,10 @@ def parse_datetime_param(value: Optional[str]) -> Optional[datetime]:
             return datetime.strptime(value, "%Y-%m-%d")
         return datetime.fromisoformat(value)
     except ValueError:
-        return None
+        raise ValidationException(
+            f"日期格式错误，正确格式为 YYYY-MM-DD 或 ISO 8601 格式，当前值: {value}",
+            field=field_name
+        )
 
 
 @app.get("/", tags=["系统"], summary="系统健康检查")
@@ -72,9 +105,9 @@ def api_list_stools(
     date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
-    dt_from = parse_datetime_param(date_from)
-    dt_to = parse_datetime_param(date_to)
-    if dt_to and len(date_to) == 10:
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
+    if dt_to and date_to and len(date_to) == 10:
         dt_to = dt_to.replace(hour=23, minute=59, second=59)
 
     total, items = list_stools(
@@ -152,8 +185,8 @@ def api_list_records(
     date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
-    dt_from = parse_datetime_param(date_from)
-    dt_to = parse_datetime_param(date_to)
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
     if dt_to and date_to and len(date_to) == 10:
         dt_to = dt_to.replace(hour=23, minute=59, second=59)
 
@@ -193,8 +226,8 @@ def api_turnover_stats(
     date_to: Optional[str] = Query(None, description="统计时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
-    dt_from = parse_datetime_param(date_from)
-    dt_to = parse_datetime_param(date_to)
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
     if dt_to and date_to and len(date_to) == 10:
         dt_to = dt_to.replace(hour=23, minute=59, second=59)
 
@@ -213,8 +246,8 @@ def api_abnormal_areas(
     date_to: Optional[str] = Query(None, description="统计时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
-    dt_from = parse_datetime_param(date_from)
-    dt_to = parse_datetime_param(date_to)
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
     if dt_to and date_to and len(date_to) == 10:
         dt_to = dt_to.replace(hour=23, minute=59, second=59)
 

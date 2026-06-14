@@ -89,6 +89,40 @@ def update_stool(db: Session, stool_id: int, data: StoolUpdate) -> Stool:
         raise NotFoundException("座凳", str(stool_id))
 
     update_data = data.model_dump(exclude_unset=True)
+
+    if "status" in update_data and update_data["status"] is not None:
+        new_status = update_data["status"]
+        current_status = stool.status
+
+        if current_status == StoolStatus.BORROWED:
+            raise StatusConflictException(
+                f"座凳正处于「{current_status.value}」状态，存在活跃借出记录，不可直接修改状态",
+                current_status=current_status.value,
+                expected_status="通过正常借还流程更新状态"
+            )
+
+        if new_status == StoolStatus.RESTORED:
+            latest_record = db.query(BorrowRecord).filter(
+                BorrowRecord.stool_id == stool_id
+            ).order_by(BorrowRecord.created_at.desc()).first()
+            if latest_record and latest_record.returned_at and not latest_record.reviewed_at:
+                raise StatusConflictException(
+                    "座凳存在未完成复核的借阅记录，不可直接标记为恢复可用",
+                    current_status=current_status.value,
+                    expected_status="通过复核流程完成后自动更新"
+                )
+
+        valid_direct_changes = {
+            (StoolStatus.PENDING_ISSUE, StoolStatus.RESTORED): True,
+            (StoolStatus.RESTORED, StoolStatus.PENDING_ISSUE): True,
+        }
+        if (current_status, new_status) not in valid_direct_changes and new_status != current_status:
+            raise StatusConflictException(
+                f"不允许直接从「{current_status.value}」修改为「{new_status.value}」，请通过业务流程操作",
+                current_status=current_status.value,
+                expected_status="使用发放/回收/清洁/复核等流程接口更新状态"
+            )
+
     for key, value in update_data.items():
         if value is not None:
             if isinstance(value, str) and hasattr(data, key):

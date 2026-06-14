@@ -202,11 +202,14 @@ def get_turnover_distribution(
     total_hours = 0.0
     count_data = []
 
+    for rec in records:
+        h = rec.turnover_hours or 0
+        total_hours += h
+
     for label, min_h, max_h in ranges_def:
         count = 0
         for rec in records:
             h = rec.turnover_hours or 0
-            total_hours += h
             if min_h <= h < max_h:
                 count += 1
         count_data.append((label, count))
@@ -264,7 +267,7 @@ def get_abnormal_areas(
         if stats["total"] == 0:
             continue
         rate = round(stats["abnormal"] / stats["total"] * 100, 2)
-        if rate >= min_abnormal_rate or stats["abnormal"] > 0:
+        if rate >= min_abnormal_rate:
             items.append(AbnormalAreaItem(
                 storage_area=area,
                 total_records=stats["total"],
