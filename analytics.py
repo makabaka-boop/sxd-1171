@@ -536,7 +536,9 @@ def get_abnormal_areas(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None
 ) -> Tuple[int, List[AbnormalAreaItem]]:
-    base_query = db.query(BorrowRecord).join(Stool)
+    base_query = db.query(BorrowRecord).join(Stool).filter(
+        BorrowRecord.source_type != "巡检异常"
+    )
     recent_window = datetime.utcnow() - timedelta(days=7)
 
     if date_from:

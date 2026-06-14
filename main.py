@@ -478,6 +478,12 @@ def api_list_reservations(
     return ReservationListResponse(total=total, items=items)
 
 
+@app.get("/api/reservations/summary", response_model=ReservationSummary, tags=["预约管理"], summary="预约统计概览")
+def api_reservations_summary(db: Session = Depends(get_db)):
+    summary = get_reservations_summary(db)
+    return ReservationSummary(**summary)
+
+
 @app.get("/api/reservations/{reservation_id}", response_model=ReservationDetailResponse, tags=["预约管理"], summary="查询预约详情")
 def api_get_reservation(reservation_id: int, db: Session = Depends(get_db)):
     reservation = get_reservation_detail(db, reservation_id)
@@ -524,12 +530,6 @@ def api_get_reservation_logs(reservation_id: int, db: Session = Depends(get_db))
         "total": len(logs),
         "items": [ReservationLogResponse.model_validate(log) for log in logs]
     }
-
-
-@app.get("/api/reservations/summary", response_model=ReservationSummary, tags=["预约管理"], summary="预约统计概览")
-def api_reservations_summary(db: Session = Depends(get_db)):
-    summary = get_reservations_summary(db)
-    return ReservationSummary(**summary)
 
 
 if __name__ == "__main__":

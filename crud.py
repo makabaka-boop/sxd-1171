@@ -24,9 +24,13 @@ from exceptions import ValidationException, StatusConflictException, NotFoundExc
 def validate_stool_create(db: Session, data: StoolCreate):
     if not data.stool_number or not data.stool_number.strip():
         raise ValidationException("座凳编号不能为空", "stool_number")
-    existing = db.query(Stool).filter(Stool.stool_number == data.stool_number).first()
+    if not data.storage_area or not data.storage_area.strip():
+        raise ValidationException("存放区域不能为空", "storage_area")
+    if not data.responsible_person or not data.responsible_person.strip():
+        raise ValidationException("责任人不能为空", "responsible_person")
+    existing = db.query(Stool).filter(Stool.stool_number == data.stool_number.strip()).first()
     if existing:
-        raise ValidationException(f"座凳编号已存在: {data.stool_number}", "stool_number")
+        raise ValidationException(f"座凳编号已存在: {data.stool_number.strip()}", "stool_number")
     if data.inspection_cycle_days <= 0:
         raise ValidationException("巡查周期必须大于0天", "inspection_cycle_days")
 
@@ -753,11 +757,31 @@ def submit_inspection_result(db: Session, data: SubmitInspectionResultRequest) -
 
     if data.inspection_result == InspectionResult.NORMAL:
         task.task_status = InspectionTaskStatus.COMPLETED_NORMAL
-        stool.status = StoolStatus.RESTORED
+
+        next_reservation = get_active_reservation_for_stool(db, task.stool_id)
+        if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+            stool.status = StoolStatus.RESERVED
+            next_reservation.status = ReservationStatus.CONFIRMED
+            next_reservation.confirmed_at = now
+            next_reservation.confirmed_by = data.inspected_by.strip()
+            add_reservation_log(
+                db, next_reservation.id, "自动递补确认", data.inspected_by.strip(),
+                description="巡检结果正常，排队预约自动递补确认",
+                from_status=ReservationStatus.PENDING.value,
+                to_status=ReservationStatus.CONFIRMED.value,
+                details={
+                    "stool_number": stool.stool_number,
+                    "inspection_task_id": task.id
+                }
+            )
+        elif stool.status == StoolStatus.RESERVED and has_active_reservation(db, task.stool_id):
+            pass
+        else:
+            stool.status = StoolStatus.RESTORED
 
         add_inspection_log(
             db, task.id, "提交巡检结果", data.inspected_by,
-            description="巡检结果正常，座凳恢复可用状态",
+            description="巡检结果正常" + ("，座凳维持已预约状态" if stool.status == StoolStatus.RESERVED else "，座凳恢复可用状态"),
             from_status=old_status.value,
             to_status=InspectionTaskStatus.COMPLETED_NORMAL.value,
             details={"inspection_result": "正常"}
@@ -861,11 +885,29 @@ def review_inspection_task(db: Session, data: ReviewInspectionTaskRequest) -> In
 
     if data.review_result == "恢复可用":
         task.task_status = InspectionTaskStatus.COMPLETED_ABNORMAL
-        stool.status = StoolStatus.RESTORED
+
+        next_reservation = get_active_reservation_for_stool(db, task.stool_id)
+        if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+            stool.status = StoolStatus.RESERVED
+            next_reservation.status = ReservationStatus.CONFIRMED
+            next_reservation.confirmed_at = now
+            next_reservation.confirmed_by = data.reviewed_by.strip()
+            add_reservation_log(
+                db, next_reservation.id, "自动递补确认", data.reviewed_by.strip(),
+                description="巡检异常复核通过恢复可用，排队预约自动递补确认",
+                from_status=ReservationStatus.PENDING.value,
+                to_status=ReservationStatus.CONFIRMED.value,
+                details={
+                    "stool_number": stool.stool_number,
+                    "inspection_task_id": task.id
+                }
+            )
+        else:
+            stool.status = StoolStatus.RESTORED
 
         add_inspection_log(
             db, task.id, "复核完成", data.reviewed_by,
-            description="复核通过，座凳恢复可用",
+            description="复核通过" + ("，座凳维持已预约状态" if stool.status == StoolStatus.RESERVED else "，座凳恢复可用"),
             from_status=old_status.value,
             to_status=InspectionTaskStatus.COMPLETED_ABNORMAL.value,
             details={"review_result": "恢复可用", "review_note": data.review_note}
@@ -1306,7 +1348,21 @@ def cancel_reservation(
     stool = get_stool(db, reservation.stool_id)
     if stool and stool.status == StoolStatus.RESERVED:
         next_reservation = get_active_reservation_for_stool(db, reservation.stool_id)
-        if not next_reservation:
+        if next_reservation:
+            next_reservation.status = ReservationStatus.CONFIRMED
+            next_reservation.confirmed_at = now
+            next_reservation.confirmed_by = data.cancelled_by.strip()
+            add_reservation_log(
+                db, next_reservation.id, "自动递补确认", data.cancelled_by.strip(),
+                description="上一预约取消，排队预约自动递补确认",
+                from_status=ReservationStatus.PENDING.value,
+                to_status=ReservationStatus.CONFIRMED.value,
+                details={
+                    "previous_reservation_id": reservation.id,
+                    "stool_number": reservation.stool_number
+                }
+            )
+        else:
             if has_pending_cleaning_or_review(db, reservation.stool_id):
                 pass
             else:
@@ -1352,6 +1408,18 @@ def confirm_reservation(
     stool = get_stool(db, reservation.stool_id)
     if not stool:
         raise NotFoundException("座凳", str(reservation.stool_id))
+
+    existing_confirmed = db.query(Reservation).filter(
+        Reservation.stool_id == reservation.stool_id,
+        Reservation.status == ReservationStatus.CONFIRMED,
+        Reservation.id != reservation.id
+    ).first()
+    if existing_confirmed:
+        raise StatusConflictException(
+            f"座凳已存在已确认的预约（预约ID：{existing_confirmed.id}），不可重复确认",
+            current_status=stool.status.value,
+            expected_status="无其他已确认预约"
+        )
 
     if stool.status not in [StoolStatus.PENDING_ISSUE, StoolStatus.RESTORED, StoolStatus.RESERVED]:
         raise StatusConflictException(
