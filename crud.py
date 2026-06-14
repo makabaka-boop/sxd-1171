@@ -7,7 +7,8 @@ from sqlalchemy import func, and_, or_
 from models import (
     Stool, BorrowRecord, StoolStatus, LoadLevel,
     InspectionTask, InspectionTaskStatus, InspectionResult,
-    InspectionTaskLog, Reservation, ReservationStatus, ReservationLog
+    InspectionTaskLog, Reservation, ReservationStatus, ReservationLog,
+    ReservationExpireRule, ReservationExpireStatus
 )
 from schemas import (
     StoolCreate, StoolUpdate,
@@ -16,7 +17,8 @@ from schemas import (
     GenerateInspectionTasksRequest, SubmitInspectionResultRequest,
     ReviewInspectionTaskRequest, RestoreInspectedStoolRequest,
     CreateReservationRequest, CancelReservationRequest,
-    ConfirmReservationRequest, IssueByReservationRequest
+    ConfirmReservationRequest, IssueByReservationRequest,
+    ReservationExpireRuleCreate, ReservationExpireRuleUpdate
 )
 from exceptions import ValidationException, StatusConflictException, NotFoundException
 
@@ -69,7 +71,9 @@ def list_stools(
     status: Optional[StoolStatus] = None,
     is_abnormal: Optional[bool] = None,
     date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None
+    date_to: Optional[datetime] = None,
+    reservation_expire_status: Optional[ReservationExpireStatus] = None,
+    applicant: Optional[str] = None
 ):
     query = db.query(Stool)
 
@@ -90,10 +94,26 @@ def list_stools(
         query = query.filter(Stool.created_at >= date_from)
     if date_to:
         query = query.filter(Stool.created_at <= date_to)
+    if applicant:
+        query = query.join(Reservation, Stool.id == Reservation.stool_id).filter(
+            Reservation.applicant.like(f"%{applicant}%"),
+            Reservation.status.in_([ReservationStatus.PENDING, ReservationStatus.CONFIRMED])
+        )
 
-    total = query.count()
-    items = query.order_by(Stool.updated_at.desc()).offset(skip).limit(limit).all()
-    return total, items
+    items = query.order_by(Stool.updated_at.desc()).all()
+
+    if reservation_expire_status:
+        filtered_items = []
+        for stool in items:
+            enriched = get_stool_with_reservation_info(db, stool)
+            if enriched.get("active_reservation_expire_status") == reservation_expire_status:
+                filtered_items.append(stool)
+        items = filtered_items
+
+    total = len(items)
+    paged_items = items[skip:skip + limit]
+
+    return total, paged_items
 
 
 def update_stool(db: Session, stool_id: int, data: StoolUpdate) -> Stool:
@@ -1077,6 +1097,199 @@ PRIORITY_WEIGHT_TIME = 1.0
 PRIORITY_WEIGHT_LOAD = 0.5
 
 
+def get_active_expire_rule(db: Session) -> ReservationExpireRule:
+    rule = db.query(ReservationExpireRule).filter(
+        ReservationExpireRule.is_active == 1
+    ).order_by(ReservationExpireRule.id.desc()).first()
+    if not rule:
+        rule = ReservationExpireRule(
+            rule_name="默认规则",
+            is_active=1,
+            pending_expire_hours=24,
+            confirmed_expire_hours=12,
+            expected_use_grace_hours=2,
+            expire_soon_hours=2,
+            auto_release=1,
+            auto_release_to_pending=0,
+            auto_confirm_next=1,
+            created_by="system"
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+    return rule
+
+
+def create_expire_rule(db: Session, data: ReservationExpireRuleCreate) -> ReservationExpireRule:
+    existing = db.query(ReservationExpireRule).filter(
+        ReservationExpireRule.rule_name == data.rule_name.strip()
+    ).first()
+    if existing:
+        raise ValidationException(f"规则名称已存在: {data.rule_name.strip()}", "rule_name")
+
+    if data.is_active == 1:
+        db.query(ReservationExpireRule).filter(
+            ReservationExpireRule.is_active == 1
+        ).update({ReservationExpireRule.is_active: 0})
+        db.flush()
+
+    rule = ReservationExpireRule(
+        rule_name=data.rule_name.strip(),
+        is_active=data.is_active,
+        pending_expire_hours=data.pending_expire_hours,
+        confirmed_expire_hours=data.confirmed_expire_hours,
+        expected_use_grace_hours=data.expected_use_grace_hours,
+        expire_soon_hours=data.expire_soon_hours,
+        auto_release=data.auto_release,
+        auto_release_to_pending=data.auto_release_to_pending,
+        auto_confirm_next=data.auto_confirm_next,
+        created_by=data.created_by.strip()
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def update_expire_rule(db: Session, rule_id: int, data: ReservationExpireRuleUpdate) -> ReservationExpireRule:
+    rule = db.query(ReservationExpireRule).filter(ReservationExpireRule.id == rule_id).first()
+    if not rule:
+        raise NotFoundException("到期规则", str(rule_id))
+
+    update_data = data.model_dump(exclude_unset=True)
+
+    if "rule_name" in update_data and update_data["rule_name"]:
+        existing = db.query(ReservationExpireRule).filter(
+            ReservationExpireRule.rule_name == update_data["rule_name"].strip(),
+            ReservationExpireRule.id != rule_id
+        ).first()
+        if existing:
+            raise ValidationException(f"规则名称已存在: {update_data['rule_name'].strip()}", "rule_name")
+        update_data["rule_name"] = update_data["rule_name"].strip()
+
+    if "is_active" in update_data and update_data["is_active"] == 1:
+        db.query(ReservationExpireRule).filter(
+            ReservationExpireRule.is_active == 1,
+            ReservationExpireRule.id != rule_id
+        ).update({ReservationExpireRule.is_active: 0})
+        db.flush()
+
+    for key, value in update_data.items():
+        if value is not None:
+            setattr(rule, key, value)
+
+    rule.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def list_expire_rules(db: Session) -> List[ReservationExpireRule]:
+    return db.query(ReservationExpireRule).order_by(ReservationExpireRule.updated_at.desc()).all()
+
+
+def get_expire_rule(db: Session, rule_id: int) -> Optional[ReservationExpireRule]:
+    return db.query(ReservationExpireRule).filter(ReservationExpireRule.id == rule_id).first()
+
+
+def delete_expire_rule(db: Session, rule_id: int):
+    rule = get_expire_rule(db, rule_id)
+    if not rule:
+        raise NotFoundException("到期规则", str(rule_id))
+    if rule.is_active == 1:
+        raise StatusConflictException(
+            "不能删除当前启用的规则，请先启用其他规则",
+            current_status="已启用",
+            expected_status="已停用"
+        )
+    db.delete(rule)
+    db.commit()
+
+
+def calculate_reservation_expire_status(
+    db: Session,
+    reservation: Reservation
+) -> tuple[ReservationExpireStatus, bool, Optional[str]]:
+    now = datetime.utcnow()
+    rule = get_active_expire_rule(db)
+
+    if reservation.status in [ReservationStatus.CANCELLED, ReservationStatus.COMPLETED, ReservationStatus.RELEASED]:
+        if reservation.status == ReservationStatus.RELEASED:
+            return ReservationExpireStatus.RELEASED, False, None
+        return ReservationExpireStatus.NORMAL, False, None
+
+    if reservation.status == ReservationStatus.EXPIRED:
+        if reservation.expired_processed_at:
+            return ReservationExpireStatus.EXPIRED_HANDLED, False, "已过期且已处理"
+        return ReservationExpireStatus.EXPIRED_UNHANDLED, False, "已过期未处理"
+
+    expire_time = None
+    expire_reason = None
+
+    if reservation.status == ReservationStatus.CONFIRMED:
+        if reservation.expected_use_time:
+            grace_deadline = reservation.expected_use_time + timedelta(hours=rule.expected_use_grace_hours)
+            if now >= grace_deadline:
+                expire_time = grace_deadline
+                expire_reason = f"已超过预期使用时间 {rule.expected_use_grace_hours} 小时宽限期"
+
+        if not expire_time and reservation.confirmed_at:
+            confirmed_deadline = reservation.confirmed_at + timedelta(hours=rule.confirmed_expire_hours)
+            if now >= confirmed_deadline:
+                expire_time = confirmed_deadline
+                expire_reason = f"已确认后超过 {rule.confirmed_expire_hours} 小时未发放"
+
+    if not expire_time and reservation.status == ReservationStatus.PENDING:
+        pending_deadline = reservation.reserved_at + timedelta(hours=rule.pending_expire_hours)
+        if now >= pending_deadline:
+            expire_time = pending_deadline
+            expire_reason = f"待确认超过 {rule.pending_expire_hours} 小时未处理"
+
+    if expire_time:
+        return ReservationExpireStatus.EXPIRED_UNHANDLED, False, expire_reason
+
+    is_expire_soon = False
+    if reservation.expired_at:
+        soon_threshold = now + timedelta(hours=rule.expire_soon_hours)
+        if reservation.expired_at <= soon_threshold and reservation.expired_at > now:
+            is_expire_soon = True
+
+    return ReservationExpireStatus.NORMAL, is_expire_soon, None
+
+
+def get_reservation_with_expire_info(db: Session, reservation: Reservation) -> dict:
+    expire_status, is_expire_soon, _ = calculate_reservation_expire_status(db, reservation)
+    data = reservation.__dict__.copy()
+    if "_sa_instance_state" in data:
+        del data["_sa_instance_state"]
+    data["expire_status"] = expire_status
+    data["is_expire_soon"] = is_expire_soon
+    return data
+
+
+def get_stool_with_reservation_info(db: Session, stool: Stool) -> dict:
+    data = stool.__dict__.copy()
+    if "_sa_instance_state" in data:
+        del data["_sa_instance_state"]
+
+    active_reservation = get_active_reservation_for_stool(db, stool.id)
+    if active_reservation:
+        expire_status, is_expire_soon, _ = calculate_reservation_expire_status(db, active_reservation)
+        data["active_reservation_id"] = active_reservation.id
+        data["active_reservation_status"] = active_reservation.status
+        data["active_reservation_expire_status"] = expire_status
+        data["active_reservation_applicant"] = active_reservation.applicant
+        data["active_reservation_expired_at"] = active_reservation.expired_at
+    else:
+        data["active_reservation_id"] = None
+        data["active_reservation_status"] = None
+        data["active_reservation_expire_status"] = None
+        data["active_reservation_applicant"] = None
+        data["active_reservation_expired_at"] = None
+
+    return data
+
+
 def add_reservation_log(
     db: Session,
     reservation_id: int,
@@ -1305,8 +1518,12 @@ def list_reservations(
     load_level: Optional[LoadLevel] = None,
     applicant: Optional[str] = None,
     status: Optional[ReservationStatus] = None,
+    expire_status: Optional[ReservationExpireStatus] = None,
+    is_expire_soon: Optional[bool] = None,
     date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None
+    date_to: Optional[datetime] = None,
+    expected_use_from: Optional[datetime] = None,
+    expected_use_to: Optional[datetime] = None
 ):
     query = db.query(Reservation)
 
@@ -1324,14 +1541,31 @@ def list_reservations(
         query = query.filter(Reservation.created_at >= date_from)
     if date_to:
         query = query.filter(Reservation.created_at <= date_to)
+    if expected_use_from:
+        query = query.filter(Reservation.expected_use_time >= expected_use_from)
+    if expected_use_to:
+        query = query.filter(Reservation.expected_use_time <= expected_use_to)
 
-    total = query.count()
     items = query.order_by(
         Reservation.priority_score.desc(),
         Reservation.reserved_at.asc()
-    ).offset(skip).limit(limit).all()
+    ).all()
 
-    return total, items
+    if expire_status or is_expire_soon is not None:
+        filtered_items = []
+        for res in items:
+            es, ies, _ = calculate_reservation_expire_status(db, res)
+            if expire_status and es != expire_status:
+                continue
+            if is_expire_soon is not None and ies != is_expire_soon:
+                continue
+            filtered_items.append(res)
+        items = filtered_items
+
+    total = len(items)
+    paged_items = items[skip:skip + limit]
+
+    return total, paged_items
 
 
 def cancel_reservation(
@@ -1555,62 +1789,198 @@ def issue_by_reservation(
     return record
 
 
-def expire_reservations(db: Session) -> int:
+def process_expired_reservations(db: Session) -> dict:
     now = datetime.utcnow()
+    rule = get_active_expire_rule(db)
     expired_count = 0
+    released_count = 0
+    auto_confirm_count = 0
 
-    expired_reservations = db.query(Reservation).filter(
+    candidates = db.query(Reservation).filter(
         Reservation.status.in_([
             ReservationStatus.PENDING,
             ReservationStatus.CONFIRMED
-        ]),
-        Reservation.expired_at <= now
+        ])
     ).all()
 
-    for reservation in expired_reservations:
+    to_expire = []
+    for res in candidates:
+        expire_reason = None
+
+        if res.expired_at and res.expired_at <= now:
+            hours_since_expire = round((now - res.expired_at).total_seconds() / 3600, 2)
+            expire_reason = f"预约已超过过期时间，已过期 {hours_since_expire} 小时"
+        else:
+            _, _, rule_reason = calculate_reservation_expire_status(db, res)
+            if rule_reason:
+                expire_reason = rule_reason
+
+        if expire_reason:
+            to_expire.append((res, expire_reason))
+
+    for reservation, expire_reason in to_expire:
         old_status = reservation.status
         reservation.status = ReservationStatus.EXPIRED
         reservation.queue_position = None
+        reservation.expired_processed_at = now
+        reservation.expire_reason = expire_reason
 
         add_reservation_log(
             db, reservation.id, "自动过期", "system",
-            description=f"预约超过 {RESERVATION_EXPIRE_HOURS} 小时未处理，自动失效",
+            description=expire_reason,
             from_status=old_status.value,
             to_status=ReservationStatus.EXPIRED.value,
             details={
                 "stool_number": reservation.stool_number,
-                "expired_at": reservation.expired_at.isoformat() if reservation.expired_at else None
+                "expire_reason": expire_reason,
+                "expected_use_time": reservation.expected_use_time.isoformat() if reservation.expected_use_time else None,
+                "confirmed_at": reservation.confirmed_at.isoformat() if reservation.confirmed_at else None,
+                "reserved_at": reservation.reserved_at.isoformat() if reservation.reserved_at else None
             }
         )
 
+        expired_count += 1
+
         stool = get_stool(db, reservation.stool_id)
         if stool and stool.status == StoolStatus.RESERVED:
-            next_reservation = get_active_reservation_for_stool(db, reservation.stool_id)
-            if next_reservation:
-                next_reservation.status = ReservationStatus.CONFIRMED
-                next_reservation.confirmed_at = now
-                next_reservation.confirmed_by = "system"
-                add_reservation_log(
-                    db, next_reservation.id, "自动递补确认", "system",
-                    description=f"上一预约过期，排队自动递补",
-                    from_status=ReservationStatus.PENDING.value,
-                    to_status=ReservationStatus.CONFIRMED.value,
-                    details={"previous_reservation_id": reservation.id}
-                )
-            else:
-                if has_pending_cleaning_or_review(db, reservation.stool_id):
-                    pass
-                else:
-                    stool.status = StoolStatus.RESTORED
-                    stool.updated_at = now
+            if rule.auto_confirm_next:
+                next_reservation = get_active_reservation_for_stool(db, reservation.stool_id)
+                if next_reservation and next_reservation.id != reservation.id:
+                    next_reservation.status = ReservationStatus.CONFIRMED
+                    next_reservation.confirmed_at = now
+                    next_reservation.confirmed_by = "system"
+                    add_reservation_log(
+                        db, next_reservation.id, "自动递补确认", "system",
+                        description=f"上一预约过期，排队自动递补",
+                        from_status=ReservationStatus.PENDING.value,
+                        to_status=ReservationStatus.CONFIRMED.value,
+                        details={
+                            "previous_reservation_id": reservation.id,
+                            "stool_number": reservation.stool_number
+                        }
+                    )
+                    auto_confirm_count += 1
+                    continue
 
-        expired_count += 1
+            if rule.auto_release:
+                if has_pending_cleaning_or_review(db, reservation.stool_id):
+                    add_reservation_log(
+                        db, reservation.id, "资源保留", "system",
+                        description="座凳存在待清洁/复核流程，暂不释放资源",
+                        from_status=old_status.value,
+                        to_status=ReservationStatus.EXPIRED.value,
+                        details={"stool_number": reservation.stool_number}
+                    )
+                else:
+                    if rule.auto_release_to_pending:
+                        stool.status = StoolStatus.PENDING_ISSUE
+                    else:
+                        stool.status = StoolStatus.RESTORED
+                    stool.updated_at = now
+                    reservation.released_at = now
+
+                    add_reservation_log(
+                        db, reservation.id, "资源释放", "system",
+                        description=f"座凳资源已释放，状态更新为「{stool.status.value}」",
+                        from_status=StoolStatus.RESERVED.value,
+                        to_status=stool.status.value,
+                        details={
+                            "stool_number": stool.stool_number,
+                            "new_stool_status": stool.status.value,
+                            "auto_release_to_pending": rule.auto_release_to_pending
+                        }
+                    )
+                    released_count += 1
 
     if expired_count > 0:
         update_queue_positions(db)
         db.commit()
 
-    return expired_count
+    return {
+        "expired_count": expired_count,
+        "released_count": released_count,
+        "auto_confirm_count": auto_confirm_count
+    }
+
+
+def expire_reservations(db: Session) -> int:
+    result = process_expired_reservations(db)
+    return result["expired_count"]
+
+
+def release_expired_reservation_stool(
+    db: Session,
+    reservation_id: int,
+    released_by: str,
+    to_pending: bool = False
+) -> Reservation:
+    reservation = get_reservation(db, reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(reservation_id))
+
+    if reservation.status != ReservationStatus.EXPIRED:
+        raise StatusConflictException(
+            f"预约当前状态为「{reservation.status.value}」，不可执行释放操作",
+            current_status=reservation.status.value,
+            expected_status=ReservationStatus.EXPIRED.value
+        )
+
+    if reservation.released_at:
+        raise StatusConflictException(
+            "该预约的座凳资源已释放，不可重复操作",
+            current_status="已释放",
+            expected_status="未释放"
+        )
+
+    stool = get_stool(db, reservation.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(reservation.stool_id))
+
+    if has_pending_cleaning_or_review(db, reservation.stool_id):
+        raise StatusConflictException(
+            "座凳存在待清洁/复核流程，暂不可释放",
+            current_status="待清洁/复核中",
+            expected_status="无待处理流程"
+        )
+
+    now = datetime.utcnow()
+
+    if stool.status == StoolStatus.RESERVED:
+        if to_pending:
+            stool.status = StoolStatus.PENDING_ISSUE
+        else:
+            stool.status = StoolStatus.RESTORED
+        stool.updated_at = now
+
+        add_reservation_log(
+            db, reservation.id, "手动释放资源", released_by.strip(),
+            description=f"手动释放座凳资源，状态更新为「{stool.status.value}」",
+            from_status=StoolStatus.RESERVED.value,
+            to_status=stool.status.value,
+            details={
+                "stool_number": stool.stool_number,
+                "new_stool_status": stool.status.value
+            }
+        )
+    else:
+        add_reservation_log(
+            db, reservation.id, "确认已释放", released_by.strip(),
+            description=f"确认座凳当前状态为「{stool.status.value}」，无需重复释放",
+            from_status=None,
+            to_status=None,
+            details={
+                "stool_number": stool.stool_number,
+                "current_stool_status": stool.status.value
+            }
+        )
+
+    reservation.status = ReservationStatus.RELEASED
+    reservation.released_at = now
+    reservation.expired_processed_at = now
+
+    db.commit()
+    db.refresh(reservation)
+    return reservation
 
 
 def get_reservation_logs(
@@ -1630,6 +2000,21 @@ def get_reservations_summary(db: Session) -> dict:
         ])
     ).count()
 
+    all_reservations = db.query(Reservation).all()
+
+    expire_soon_count = 0
+    expired_unhandled_count = 0
+    expired_handled_count = 0
+
+    for res in all_reservations:
+        expire_status, is_expire_soon, _ = calculate_reservation_expire_status(db, res)
+        if is_expire_soon:
+            expire_soon_count += 1
+        if expire_status == ReservationExpireStatus.EXPIRED_UNHANDLED:
+            expired_unhandled_count += 1
+        elif expire_status == ReservationExpireStatus.EXPIRED_HANDLED:
+            expired_handled_count += 1
+
     summary = {
         "total_reservations": db.query(Reservation).count(),
         "pending_count": db.query(Reservation).filter(
@@ -1647,7 +2032,13 @@ def get_reservations_summary(db: Session) -> dict:
         "completed_count": db.query(Reservation).filter(
             Reservation.status == ReservationStatus.COMPLETED
         ).count(),
-        "total_queue_count": total_queue
+        "released_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.RELEASED
+        ).count(),
+        "total_queue_count": total_queue,
+        "expire_soon_count": expire_soon_count,
+        "expired_unhandled_count": expired_unhandled_count,
+        "expired_handled_count": expired_handled_count
     }
     return summary
 

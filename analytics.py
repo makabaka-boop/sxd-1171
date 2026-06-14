@@ -3,8 +3,9 @@ from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
-from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult, Reservation, ReservationStatus
+from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult, Reservation, ReservationStatus, ReservationExpireStatus
 from schemas import AlertItem, TurnoverDistributionItem, AbnormalAreaItem
+from crud import calculate_reservation_expire_status, get_active_expire_rule
 
 
 LONG_BORROW_HOURS = 72
@@ -448,6 +449,118 @@ def detect_stool_reserved_but_available_alerts(db: Session) -> List[AlertItem]:
     return alerts
 
 
+def detect_reservation_expire_soon_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+
+    active_reservations = db.query(Reservation).filter(
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    ).all()
+
+    for res in active_reservations:
+        expire_status, is_expire_soon, _ = calculate_reservation_expire_status(db, res)
+        if is_expire_soon and res.expired_at:
+            hours_until_expire = round((res.expired_at - now).total_seconds() / 3600, 1)
+            severity = "medium" if hours_until_expire <= 1 else "low"
+
+            alerts.append(AlertItem(
+                alert_type="预约即将过期",
+                severity=severity,
+                message=f"座凳 {res.stool_number} 的预约将在 {hours_until_expire} 小时后过期",
+                related_id=res.id,
+                related_stool_number=res.stool_number,
+                details={
+                    "reservation_id": res.id,
+                    "applicant": res.applicant,
+                    "status": res.status.value,
+                    "expired_at": res.expired_at.isoformat() if res.expired_at else None,
+                    "hours_until_expire": hours_until_expire,
+                    "storage_area": res.storage_area,
+                    "load_level": res.load_level.value
+                }
+            ))
+
+    return alerts
+
+
+def detect_reservation_expired_unhandled_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+
+    expired_reservations = db.query(Reservation).filter(
+        Reservation.status == ReservationStatus.EXPIRED,
+        Reservation.expired_processed_at.is_(None)
+    ).all()
+
+    for res in expired_reservations:
+        _, _, expire_reason = calculate_reservation_expire_status(db, res)
+        hours_expired = 0
+        if res.expired_at:
+            hours_expired = round((now - res.expired_at).total_seconds() / 3600, 1)
+
+        severity = "high" if hours_expired >= 24 else "medium" if hours_expired >= 12 else "low"
+
+        alerts.append(AlertItem(
+            alert_type="预约已过期未处理",
+            severity=severity,
+            message=f"座凳 {res.stool_number} 的预约已过期 {hours_expired} 小时未处理，{expire_reason or '请及时释放资源'}",
+            related_id=res.id,
+            related_stool_number=res.stool_number,
+            details={
+                "reservation_id": res.id,
+                "applicant": res.applicant,
+                "expired_at": res.expired_at.isoformat() if res.expired_at else None,
+                "hours_expired": hours_expired,
+                "expire_reason": expire_reason,
+                "stool_status": None,
+                "storage_area": res.storage_area,
+                "load_level": res.load_level.value
+            }
+        ))
+
+    return alerts
+
+
+def detect_reservation_released_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_24h = now - timedelta(hours=24)
+
+    released_reservations = db.query(Reservation).filter(
+        Reservation.status == ReservationStatus.RELEASED,
+        Reservation.released_at >= threshold_24h
+    ).all()
+
+    for res in released_reservations:
+        hours_since_release = 0
+        if res.released_at:
+            hours_since_release = round((now - res.released_at).total_seconds() / 3600, 1)
+
+        severity = "low"
+
+        alerts.append(AlertItem(
+            alert_type="预约资源已释放",
+            severity=severity,
+            message=f"座凳 {res.stool_number} 的预约资源已释放 {hours_since_release} 小时",
+            related_id=res.id,
+            related_stool_number=res.stool_number,
+            details={
+                "reservation_id": res.id,
+                "applicant": res.applicant,
+                "released_at": res.released_at.isoformat() if res.released_at else None,
+                "hours_since_release": hours_since_release,
+                "expire_reason": res.expire_reason,
+                "storage_area": res.storage_area,
+                "load_level": res.load_level.value
+            }
+        ))
+
+    return alerts
+
+
 def get_all_alerts(db: Session, alert_type: Optional[str] = None, severity: Optional[str] = None) -> List[AlertItem]:
     all_alerts = []
     all_alerts.extend(detect_long_borrow_alerts(db))
@@ -461,6 +574,9 @@ def get_all_alerts(db: Session, alert_type: Optional[str] = None, severity: Opti
     all_alerts.extend(detect_reservation_confirmed_not_issued_alerts(db))
     all_alerts.extend(detect_reservation_queue_long_alerts(db))
     all_alerts.extend(detect_stool_reserved_but_available_alerts(db))
+    all_alerts.extend(detect_reservation_expire_soon_alerts(db))
+    all_alerts.extend(detect_reservation_expired_unhandled_alerts(db))
+    all_alerts.extend(detect_reservation_released_alerts(db))
 
     if alert_type:
         all_alerts = [a for a in all_alerts if a.alert_type == alert_type]

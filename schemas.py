@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
-from models import StoolStatus, LoadLevel, InspectionTaskStatus, InspectionResult, ReservationStatus
+from models import StoolStatus, LoadLevel, InspectionTaskStatus, InspectionResult, ReservationStatus, ReservationExpireStatus
 
 
 class StoolBase(BaseModel):
@@ -28,6 +28,50 @@ class StoolUpdate(BaseModel):
 class StoolResponse(StoolBase):
     id: int
     status: StoolStatus
+    created_at: datetime
+    updated_at: datetime
+
+    active_reservation_id: Optional[int] = None
+    active_reservation_status: Optional[ReservationStatus] = None
+    active_reservation_expire_status: Optional[ReservationExpireStatus] = None
+    active_reservation_applicant: Optional[str] = None
+    active_reservation_expired_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ReservationExpireRuleBase(BaseModel):
+    rule_name: str = Field(..., min_length=1, max_length=100, description="规则名称")
+    is_active: int = Field(1, ge=0, le=1, description="是否启用")
+    pending_expire_hours: int = Field(24, ge=1, le=168, description="待确认预约过期时间(小时)")
+    confirmed_expire_hours: int = Field(12, ge=1, le=72, description="已确认预约过期时间(小时)")
+    expected_use_grace_hours: int = Field(2, ge=0, le=24, description="超过预期使用时间的宽限期(小时)")
+    expire_soon_hours: int = Field(2, ge=0, le=24, description="即将过期预警阈值(小时)")
+    auto_release: int = Field(1, ge=0, le=1, description="是否自动释放座凳资源")
+    auto_release_to_pending: int = Field(0, ge=0, le=1, description="释放后是否置为待发放(否则为恢复可用)")
+    auto_confirm_next: int = Field(1, ge=0, le=1, description="是否自动确认下一个排队预约")
+
+
+class ReservationExpireRuleCreate(ReservationExpireRuleBase):
+    created_by: str = Field(..., min_length=1, max_length=100, description="创建人")
+
+
+class ReservationExpireRuleUpdate(BaseModel):
+    rule_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    is_active: Optional[int] = Field(None, ge=0, le=1)
+    pending_expire_hours: Optional[int] = Field(None, ge=1, le=168)
+    confirmed_expire_hours: Optional[int] = Field(None, ge=1, le=72)
+    expected_use_grace_hours: Optional[int] = Field(None, ge=0, le=24)
+    expire_soon_hours: Optional[int] = Field(None, ge=0, le=24)
+    auto_release: Optional[int] = Field(None, ge=0, le=1)
+    auto_release_to_pending: Optional[int] = Field(None, ge=0, le=1)
+    auto_confirm_next: Optional[int] = Field(None, ge=0, le=1)
+
+
+class ReservationExpireRuleResponse(ReservationExpireRuleBase):
+    id: int
+    created_by: str
     created_at: datetime
     updated_at: datetime
 
@@ -333,6 +377,13 @@ class ReservationResponse(BaseModel):
     cancel_reason: Optional[str] = None
     completed_at: Optional[datetime] = None
     borrow_record_id: Optional[int] = None
+
+    expire_status: Optional[ReservationExpireStatus] = None
+    is_expire_soon: Optional[bool] = None
+    expired_processed_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+    expire_reason: Optional[str] = None
+
     created_at: datetime
     updated_at: datetime
 
@@ -356,7 +407,11 @@ class ReservationSummary(BaseModel):
     cancelled_count: int
     expired_count: int
     completed_count: int
+    released_count: int
     total_queue_count: int
+    expire_soon_count: int
+    expired_unhandled_count: int
+    expired_handled_count: int
 
 
 class IssueByReservationRequest(BaseModel):

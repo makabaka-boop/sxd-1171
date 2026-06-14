@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import engine, get_db, Base
-from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult, ReservationStatus
+from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult, ReservationStatus, ReservationExpireStatus
 from schemas import (
     StoolCreate, StoolUpdate, StoolResponse, StoolListResponse,
     IssueStoolRequest, ReturnStoolRequest, CleanStoolRequest,
@@ -24,7 +24,9 @@ from schemas import (
     ConfirmReservationRequest, IssueByReservationRequest,
     ReservationResponse, ReservationListResponse,
     ReservationDetailResponse, ReservationSummary,
-    ReservationLogResponse
+    ReservationLogResponse,
+    ReservationExpireRuleCreate, ReservationExpireRuleUpdate,
+    ReservationExpireRuleResponse
 )
 from crud import (
     create_stool, get_stool, list_stools, update_stool, delete_stool,
@@ -36,7 +38,11 @@ from crud import (
     create_reservation, get_reservation, get_reservation_detail,
     list_reservations, cancel_reservation, confirm_reservation,
     issue_by_reservation, expire_reservations, get_reservation_logs,
-    get_reservations_summary, enrich_reservation_records
+    get_reservations_summary, enrich_reservation_records,
+    create_expire_rule, update_expire_rule, list_expire_rules,
+    get_expire_rule, delete_expire_rule, get_active_expire_rule,
+    process_expired_reservations, release_expired_reservation_stool,
+    get_stool_with_reservation_info, get_reservation_with_expire_info
 )
 from analytics import (
     get_all_alerts, get_turnover_distribution,
@@ -82,6 +88,9 @@ def ensure_compatible_schema():
                     cancel_reason TEXT,
                     completed_at DATETIME,
                     borrow_record_id INTEGER,
+                    expired_processed_at DATETIME,
+                    released_at DATETIME,
+                    expire_reason VARCHAR(200),
                     created_at DATETIME NOT NULL,
                     updated_at DATETIME NOT NULL,
                     FOREIGN KEY (stool_id) REFERENCES stools (id),
@@ -97,6 +106,14 @@ def ensure_compatible_schema():
             conn.execute(text("CREATE INDEX idx_reservations_queue_position ON reservations(queue_position)"))
             conn.execute(text("CREATE INDEX idx_reservations_priority_score ON reservations(priority_score)"))
             conn.execute(text("CREATE INDEX idx_reservations_borrow_record_id ON reservations(borrow_record_id)"))
+        else:
+            reservation_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(reservations)"))}
+            if "expired_processed_at" not in reservation_columns:
+                conn.execute(text("ALTER TABLE reservations ADD COLUMN expired_processed_at DATETIME"))
+            if "released_at" not in reservation_columns:
+                conn.execute(text("ALTER TABLE reservations ADD COLUMN released_at DATETIME"))
+            if "expire_reason" not in reservation_columns:
+                conn.execute(text("ALTER TABLE reservations ADD COLUMN expire_reason VARCHAR(200)"))
 
         if "reservation_logs" not in tables:
             conn.execute(text("""
@@ -114,6 +131,36 @@ def ensure_compatible_schema():
                 )
             """))
             conn.execute(text("CREATE INDEX idx_reservation_logs_reservation_id ON reservation_logs(reservation_id)"))
+
+        if "reservation_expire_rules" not in tables:
+            conn.execute(text("""
+                CREATE TABLE reservation_expire_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_name VARCHAR(100) NOT NULL UNIQUE,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    pending_expire_hours INTEGER NOT NULL DEFAULT 24,
+                    confirmed_expire_hours INTEGER NOT NULL DEFAULT 12,
+                    expected_use_grace_hours INTEGER NOT NULL DEFAULT 2,
+                    expire_soon_hours INTEGER NOT NULL DEFAULT 2,
+                    auto_release INTEGER NOT NULL DEFAULT 1,
+                    auto_release_to_pending INTEGER NOT NULL DEFAULT 0,
+                    auto_confirm_next INTEGER NOT NULL DEFAULT 1,
+                    created_by VARCHAR(100) NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+            """))
+            conn.execute(text("CREATE INDEX idx_reservation_expire_rules_active ON reservation_expire_rules(is_active)"))
+            conn.execute(text("""
+                INSERT OR IGNORE INTO reservation_expire_rules (
+                    rule_name, is_active, pending_expire_hours, confirmed_expire_hours,
+                    expected_use_grace_hours, expire_soon_hours, auto_release,
+                    auto_release_to_pending, auto_confirm_next, created_by, created_at, updated_at
+                ) VALUES (
+                    '默认规则', 1, 24, 12, 2, 2, 1, 0, 1, 'system',
+                    DATETIME('now'), DATETIME('now')
+                )
+            """))
 
 
 ensure_compatible_schema()
@@ -193,6 +240,8 @@ def api_list_stools(
     is_abnormal: Optional[bool] = Query(None, description="是否异常留置"),
     date_from: Optional[str] = Query(None, description="创建时间起（YYYY-MM-DD）"),
     date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
+    reservation_expire_status: Optional[ReservationExpireStatus] = Query(None, description="预约过期状态筛选"),
+    applicant: Optional[str] = Query(None, description="预约申请人筛选（模糊匹配）"),
     db: Session = Depends(get_db)
 ):
     dt_from = parse_datetime_param(date_from, "date_from")
@@ -202,9 +251,12 @@ def api_list_stools(
 
     total, items = list_stools(
         db, skip, limit, storage_area, load_level,
-        responsible_person, status, is_abnormal, dt_from, dt_to
+        responsible_person, status, is_abnormal, dt_from, dt_to,
+        reservation_expire_status, applicant
     )
-    return StoolListResponse(total=total, items=items)
+    enriched_items = [get_stool_with_reservation_info(db, stool) for stool in items]
+    response_items = [StoolResponse(**e) for e in enriched_items]
+    return StoolListResponse(total=total, items=response_items)
 
 
 @app.get("/api/stools/{stool_id}", response_model=StoolResponse, tags=["座凳管理"], summary="查询座凳详情")
@@ -212,7 +264,8 @@ def api_get_stool(stool_id: int, db: Session = Depends(get_db)):
     stool = get_stool(db, stool_id)
     if not stool:
         raise NotFoundException("座凳", str(stool_id))
-    return stool
+    enriched = get_stool_with_reservation_info(db, stool)
+    return StoolResponse(**enriched)
 
 
 @app.put("/api/stools/{stool_id}", response_model=StoolResponse, tags=["座凳管理"], summary="更新座凳信息（管理者）")
@@ -300,11 +353,35 @@ def api_get_record(record_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/alerts", response_model=AlertListResponse, tags=["预警识别"], summary="获取系统预警信息")
 def api_get_alerts(
-    alert_type: Optional[str] = Query(None, description="预警类型：借出时长过长/高承载座凳损耗集中/存放区域连续外观问题/清洁后未复核风险"),
+    alert_type: Optional[str] = Query(None, description="预警类型：借出时长过长/高承载座凳损耗集中/存放区域连续外观问题/清洁后未复核风险/预约即将过期/预约已过期未处理/预约资源已释放"),
     severity: Optional[str] = Query(None, description="严重等级：high/medium/low"),
+    storage_area: Optional[str] = Query(None, description="存放区域筛选（模糊匹配）"),
+    load_level: Optional[LoadLevel] = Query(None, description="承载等级筛选"),
+    applicant: Optional[str] = Query(None, description="申请人筛选（模糊匹配）"),
+    reservation_status: Optional[ReservationStatus] = Query(None, description="关联预约状态筛选"),
+    date_from: Optional[str] = Query(None, description="预警时间起（YYYY-MM-DD）"),
+    date_to: Optional[str] = Query(None, description="预警时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
     alerts = get_all_alerts(db, alert_type, severity)
+
+    if storage_area:
+        alerts = [a for a in alerts if a.details and a.details.get("storage_area") and storage_area in a.details.get("storage_area", "")]
+    if load_level:
+        alerts = [a for a in alerts if a.details and a.details.get("load_level") == load_level.value]
+    if applicant:
+        alerts = [a for a in alerts if a.details and a.details.get("applicant") and applicant in a.details.get("applicant", "")]
+    if reservation_status:
+        alerts = [a for a in alerts if a.details and a.details.get("status") == reservation_status.value]
+    if date_from:
+        dt_from = parse_datetime_param(date_from, "date_from")
+        alerts = [a for a in alerts if a.details and a.details.get("created_at") and datetime.fromisoformat(a.details.get("created_at", "")) >= dt_from]
+    if date_to:
+        dt_to = parse_datetime_param(date_to, "date_to")
+        if date_to and len(date_to) == 10:
+            dt_to = dt_to.replace(hour=23, minute=59, second=59)
+        alerts = [a for a in alerts if a.details and a.details.get("created_at") and datetime.fromisoformat(a.details.get("created_at", "")) <= dt_to]
+
     return AlertListResponse(total=len(alerts), items=alerts)
 
 
@@ -462,8 +539,12 @@ def api_list_reservations(
     load_level: Optional[LoadLevel] = Query(None, description="承载等级筛选"),
     applicant: Optional[str] = Query(None, description="预约人筛选（模糊匹配）"),
     status: Optional[ReservationStatus] = Query(None, description="预约状态筛选"),
+    expire_status: Optional[ReservationExpireStatus] = Query(None, description="过期状态筛选"),
+    is_expire_soon: Optional[bool] = Query(None, description="是否即将过期"),
     date_from: Optional[str] = Query(None, description="创建时间起（YYYY-MM-DD）"),
     date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
+    expected_use_from: Optional[str] = Query(None, description="期望使用时间起（YYYY-MM-DD）"),
+    expected_use_to: Optional[str] = Query(None, description="期望使用时间止（YYYY-MM-DD）"),
     db: Session = Depends(get_db)
 ):
     dt_from = parse_datetime_param(date_from, "date_from")
@@ -471,11 +552,19 @@ def api_list_reservations(
     if dt_to and date_to and len(date_to) == 10:
         dt_to = dt_to.replace(hour=23, minute=59, second=59)
 
+    exp_use_from = parse_datetime_param(expected_use_from, "expected_use_from")
+    exp_use_to = parse_datetime_param(expected_use_to, "expected_use_to")
+    if exp_use_to and expected_use_to and len(expected_use_to) == 10:
+        exp_use_to = exp_use_to.replace(hour=23, minute=59, second=59)
+
     total, items = list_reservations(
         db, skip, limit, stool_id, storage_area, load_level,
-        applicant, status, dt_from, dt_to
+        applicant, status, expire_status, is_expire_soon,
+        dt_from, dt_to, exp_use_from, exp_use_to
     )
-    return ReservationListResponse(total=total, items=items)
+    enriched_items = [get_reservation_with_expire_info(db, res) for res in items]
+    response_items = [ReservationResponse(**e) for e in enriched_items]
+    return ReservationListResponse(total=total, items=response_items)
 
 
 @app.get("/api/reservations/summary", response_model=ReservationSummary, tags=["预约管理"], summary="预约统计概览")
@@ -489,7 +578,9 @@ def api_get_reservation(reservation_id: int, db: Session = Depends(get_db)):
     reservation = get_reservation_detail(db, reservation_id)
     if not reservation:
         raise NotFoundException("预约记录", str(reservation_id))
-    return ReservationDetailResponse.model_validate(reservation)
+    enriched = get_reservation_with_expire_info(db, reservation)
+    enriched["logs"] = reservation.logs
+    return ReservationDetailResponse(**enriched)
 
 
 @app.post("/api/reservations/cancel", response_model=ReservationResponse, tags=["预约管理"], summary="取消预约（使用人/管理者）")
@@ -513,11 +604,25 @@ def api_issue_by_reservation(data: IssueByReservationRequest, db: Session = Depe
 
 @app.post("/api/reservations/expire", tags=["预约管理"], summary="触发过期预约自动释放（系统/管理者）")
 def api_expire_reservations(db: Session = Depends(get_db)):
-    expired_count = expire_reservations(db)
+    result = process_expired_reservations(db)
     return {
-        "message": f"成功处理 {expired_count} 条过期预约",
-        "expired_count": expired_count
+        "message": f"成功处理 {result['expired_count']} 条过期预约",
+        "expired_count": result["expired_count"],
+        "released_count": result["released_count"],
+        "auto_confirm_count": result["auto_confirm_count"]
     }
+
+
+@app.post("/api/reservations/{reservation_id}/release", response_model=ReservationResponse, tags=["预约管理"], summary="手动释放过期预约的座凳资源（管理者）")
+def api_release_expired_reservation_stool(
+    reservation_id: int,
+    released_by: str = Query(..., min_length=1, max_length=100, description="释放操作人"),
+    to_pending: bool = Query(False, description="是否释放为待发放状态"),
+    db: Session = Depends(get_db)
+):
+    reservation = release_expired_reservation_stool(db, reservation_id, released_by, to_pending)
+    enriched = get_reservation_with_expire_info(db, reservation)
+    return ReservationResponse(**enriched)
 
 
 @app.get("/api/reservations/{reservation_id}/logs", tags=["预约管理"], summary="查询预约操作记录")
@@ -530,6 +635,47 @@ def api_get_reservation_logs(reservation_id: int, db: Session = Depends(get_db))
         "total": len(logs),
         "items": [ReservationLogResponse.model_validate(log) for log in logs]
     }
+
+
+@app.get("/api/reservation-expire-rules", tags=["预约到期规则"], summary="查询预约到期规则列表")
+def api_list_expire_rules(db: Session = Depends(get_db)):
+    rules = list_expire_rules(db)
+    return {
+        "total": len(rules),
+        "items": [ReservationExpireRuleResponse.model_validate(r) for r in rules]
+    }
+
+
+@app.get("/api/reservation-expire-rules/active", response_model=ReservationExpireRuleResponse, tags=["预约到期规则"], summary="获取当前启用的到期规则")
+def api_get_active_expire_rule(db: Session = Depends(get_db)):
+    rule = get_active_expire_rule(db)
+    return ReservationExpireRuleResponse.model_validate(rule)
+
+
+@app.get("/api/reservation-expire-rules/{rule_id}", response_model=ReservationExpireRuleResponse, tags=["预约到期规则"], summary="查询预约到期规则详情")
+def api_get_expire_rule(rule_id: int, db: Session = Depends(get_db)):
+    rule = get_expire_rule(db, rule_id)
+    if not rule:
+        raise NotFoundException("到期规则", str(rule_id))
+    return ReservationExpireRuleResponse.model_validate(rule)
+
+
+@app.post("/api/reservation-expire-rules", response_model=ReservationExpireRuleResponse, tags=["预约到期规则"], summary="创建预约到期规则（管理者）")
+def api_create_expire_rule(data: ReservationExpireRuleCreate, db: Session = Depends(get_db)):
+    rule = create_expire_rule(db, data)
+    return ReservationExpireRuleResponse.model_validate(rule)
+
+
+@app.put("/api/reservation-expire-rules/{rule_id}", response_model=ReservationExpireRuleResponse, tags=["预约到期规则"], summary="更新预约到期规则（管理者）")
+def api_update_expire_rule(rule_id: int, data: ReservationExpireRuleUpdate, db: Session = Depends(get_db)):
+    rule = update_expire_rule(db, rule_id, data)
+    return ReservationExpireRuleResponse.model_validate(rule)
+
+
+@app.delete("/api/reservation-expire-rules/{rule_id}", tags=["预约到期规则"], summary="删除预约到期规则（管理者）")
+def api_delete_expire_rule(rule_id: int, db: Session = Depends(get_db)):
+    delete_expire_rule(db, rule_id)
+    return {"message": f"到期规则 {rule_id} 删除成功"}
 
 
 if __name__ == "__main__":

@@ -24,6 +24,15 @@ class ReservationStatus(str, enum.Enum):
     CANCELLED = "已取消"
     EXPIRED = "已过期"
     COMPLETED = "已完成"
+    RELEASED = "已释放"
+
+
+class ReservationExpireStatus(str, enum.Enum):
+    NORMAL = "正常"
+    EXPIRE_SOON = "即将过期"
+    EXPIRED_UNHANDLED = "已过期未处理"
+    EXPIRED_HANDLED = "已过期已处理"
+    RELEASED = "已释放"
 
 
 class UserRole(str, enum.Enum):
@@ -113,6 +122,27 @@ class BorrowRecord(Base):
     reservation = relationship("Reservation", back_populates="borrow_record")
 
 
+class ReservationExpireRule(Base):
+    __tablename__ = "reservation_expire_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_name = Column(String(100), nullable=False, unique=True)
+    is_active = Column(Integer, default=1, nullable=False, index=True)
+
+    pending_expire_hours = Column(Integer, default=24, nullable=False, comment="待确认预约过期时间(小时)")
+    confirmed_expire_hours = Column(Integer, default=12, nullable=False, comment="已确认预约过期时间(小时)")
+    expected_use_grace_hours = Column(Integer, default=2, nullable=False, comment="超过预期使用时间的宽限期(小时)")
+    expire_soon_hours = Column(Integer, default=2, nullable=False, comment="即将过期预警阈值(小时)")
+
+    auto_release = Column(Integer, default=1, nullable=False, comment="是否自动释放座凳资源")
+    auto_release_to_pending = Column(Integer, default=0, nullable=False, comment="释放后是否置为待发放(否则为恢复可用)")
+    auto_confirm_next = Column(Integer, default=1, nullable=False, comment="是否自动确认下一个排队预约")
+
+    created_by = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class Reservation(Base):
     __tablename__ = "reservations"
 
@@ -142,6 +172,10 @@ class Reservation(Base):
 
     completed_at = Column(DateTime, nullable=True)
     borrow_record_id = Column(Integer, ForeignKey("borrow_records.id"), nullable=True, index=True)
+
+    expired_processed_at = Column(DateTime, nullable=True, comment="过期处理时间")
+    released_at = Column(DateTime, nullable=True, comment="资源释放时间")
+    expire_reason = Column(String(200), nullable=True, comment="过期原因")
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
