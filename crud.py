@@ -758,26 +758,28 @@ def submit_inspection_result(db: Session, data: SubmitInspectionResultRequest) -
     if data.inspection_result == InspectionResult.NORMAL:
         task.task_status = InspectionTaskStatus.COMPLETED_NORMAL
 
-        next_reservation = get_active_reservation_for_stool(db, task.stool_id)
-        if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+        confirmed_reservation = get_confirmed_reservation_for_stool(db, task.stool_id)
+        if confirmed_reservation:
             stool.status = StoolStatus.RESERVED
-            next_reservation.status = ReservationStatus.CONFIRMED
-            next_reservation.confirmed_at = now
-            next_reservation.confirmed_by = data.inspected_by.strip()
-            add_reservation_log(
-                db, next_reservation.id, "自动递补确认", data.inspected_by.strip(),
-                description="巡检结果正常，排队预约自动递补确认",
-                from_status=ReservationStatus.PENDING.value,
-                to_status=ReservationStatus.CONFIRMED.value,
-                details={
-                    "stool_number": stool.stool_number,
-                    "inspection_task_id": task.id
-                }
-            )
-        elif stool.status == StoolStatus.RESERVED and has_active_reservation(db, task.stool_id):
-            pass
         else:
-            stool.status = StoolStatus.RESTORED
+            pending_reservation = get_pending_reservation_for_stool(db, task.stool_id)
+            if pending_reservation:
+                stool.status = StoolStatus.RESERVED
+                pending_reservation.status = ReservationStatus.CONFIRMED
+                pending_reservation.confirmed_at = now
+                pending_reservation.confirmed_by = data.inspected_by.strip()
+                add_reservation_log(
+                    db, pending_reservation.id, "自动递补确认", data.inspected_by.strip(),
+                    description="巡检结果正常，排队预约自动递补确认",
+                    from_status=ReservationStatus.PENDING.value,
+                    to_status=ReservationStatus.CONFIRMED.value,
+                    details={
+                        "stool_number": stool.stool_number,
+                        "inspection_task_id": task.id
+                    }
+                )
+            else:
+                stool.status = StoolStatus.RESTORED
 
         add_inspection_log(
             db, task.id, "提交巡检结果", data.inspected_by,
@@ -886,24 +888,28 @@ def review_inspection_task(db: Session, data: ReviewInspectionTaskRequest) -> In
     if data.review_result == "恢复可用":
         task.task_status = InspectionTaskStatus.COMPLETED_ABNORMAL
 
-        next_reservation = get_active_reservation_for_stool(db, task.stool_id)
-        if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+        confirmed_reservation = get_confirmed_reservation_for_stool(db, task.stool_id)
+        if confirmed_reservation:
             stool.status = StoolStatus.RESERVED
-            next_reservation.status = ReservationStatus.CONFIRMED
-            next_reservation.confirmed_at = now
-            next_reservation.confirmed_by = data.reviewed_by.strip()
-            add_reservation_log(
-                db, next_reservation.id, "自动递补确认", data.reviewed_by.strip(),
-                description="巡检异常复核通过恢复可用，排队预约自动递补确认",
-                from_status=ReservationStatus.PENDING.value,
-                to_status=ReservationStatus.CONFIRMED.value,
-                details={
-                    "stool_number": stool.stool_number,
-                    "inspection_task_id": task.id
-                }
-            )
         else:
-            stool.status = StoolStatus.RESTORED
+            pending_reservation = get_pending_reservation_for_stool(db, task.stool_id)
+            if pending_reservation:
+                stool.status = StoolStatus.RESERVED
+                pending_reservation.status = ReservationStatus.CONFIRMED
+                pending_reservation.confirmed_at = now
+                pending_reservation.confirmed_by = data.reviewed_by.strip()
+                add_reservation_log(
+                    db, pending_reservation.id, "自动递补确认", data.reviewed_by.strip(),
+                    description="巡检异常复核通过恢复可用，排队预约自动递补确认",
+                    from_status=ReservationStatus.PENDING.value,
+                    to_status=ReservationStatus.CONFIRMED.value,
+                    details={
+                        "stool_number": stool.stool_number,
+                        "inspection_task_id": task.id
+                    }
+                )
+            else:
+                stool.status = StoolStatus.RESTORED
 
         add_inspection_log(
             db, task.id, "复核完成", data.reviewed_by,
@@ -1166,6 +1172,29 @@ def get_active_reservation_for_stool(
 
 def has_active_reservation(db: Session, stool_id: int) -> bool:
     return get_active_reservation_for_stool(db, stool_id) is not None
+
+
+def get_confirmed_reservation_for_stool(
+    db: Session,
+    stool_id: int
+) -> Optional[Reservation]:
+    return db.query(Reservation).filter(
+        Reservation.stool_id == stool_id,
+        Reservation.status == ReservationStatus.CONFIRMED
+    ).first()
+
+
+def get_pending_reservation_for_stool(
+    db: Session,
+    stool_id: int
+) -> Optional[Reservation]:
+    return db.query(Reservation).filter(
+        Reservation.stool_id == stool_id,
+        Reservation.status == ReservationStatus.PENDING
+    ).order_by(
+        Reservation.priority_score.desc(),
+        Reservation.reserved_at.asc()
+    ).first()
 
 
 def create_reservation(
