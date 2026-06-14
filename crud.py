@@ -1206,6 +1206,42 @@ def delete_expire_rule(db: Session, rule_id: int):
     db.commit()
 
 
+def get_reservation_effective_expire_time(
+    db: Session,
+    reservation: Reservation
+) -> tuple[Optional[datetime], Optional[str]]:
+    now = datetime.utcnow()
+    rule = get_active_expire_rule(db)
+    candidates: List[tuple[datetime, str]] = []
+
+    if reservation.status == ReservationStatus.CONFIRMED:
+        if reservation.expected_use_time:
+            grace_deadline = reservation.expected_use_time + timedelta(hours=rule.expected_use_grace_hours)
+            candidates.append((grace_deadline, f"已超过预期使用时间 {rule.expected_use_grace_hours} 小时宽限期"))
+
+        if reservation.confirmed_at:
+            confirmed_deadline = reservation.confirmed_at + timedelta(hours=rule.confirmed_expire_hours)
+            candidates.append((confirmed_deadline, f"已确认后超过 {rule.confirmed_expire_hours} 小时未发放"))
+
+    elif reservation.status == ReservationStatus.PENDING:
+        if reservation.expected_use_time:
+            grace_deadline = reservation.expected_use_time + timedelta(hours=rule.expected_use_grace_hours)
+            candidates.append((grace_deadline, f"已超过预期使用时间 {rule.expected_use_grace_hours} 小时宽限期"))
+
+        if reservation.reserved_at:
+            pending_deadline = reservation.reserved_at + timedelta(hours=rule.pending_expire_hours)
+            candidates.append((pending_deadline, f"待确认超过 {rule.pending_expire_hours} 小时未处理"))
+
+    if reservation.expired_at and reservation.status in [ReservationStatus.PENDING, ReservationStatus.CONFIRMED, ReservationStatus.EXPIRED]:
+        candidates.append((reservation.expired_at, "预约已超过设定过期时间"))
+
+    if not candidates:
+        return None, None
+
+    effective_expire_time, effective_reason = min(candidates, key=lambda x: x[0])
+    return effective_expire_time, effective_reason
+
+
 def calculate_reservation_expire_status(
     db: Session,
     reservation: Reservation
@@ -1219,39 +1255,21 @@ def calculate_reservation_expire_status(
         return ReservationExpireStatus.NORMAL, False, None
 
     if reservation.status == ReservationStatus.EXPIRED:
+        if reservation.released_at:
+            return ReservationExpireStatus.RELEASED, False, None
         if reservation.expired_processed_at:
             return ReservationExpireStatus.EXPIRED_HANDLED, False, "已过期且已处理"
         return ReservationExpireStatus.EXPIRED_UNHANDLED, False, "已过期未处理"
 
-    expire_time = None
-    expire_reason = None
+    effective_expire_time, effective_reason = get_reservation_effective_expire_time(db, reservation)
 
-    if reservation.status == ReservationStatus.CONFIRMED:
-        if reservation.expected_use_time:
-            grace_deadline = reservation.expected_use_time + timedelta(hours=rule.expected_use_grace_hours)
-            if now >= grace_deadline:
-                expire_time = grace_deadline
-                expire_reason = f"已超过预期使用时间 {rule.expected_use_grace_hours} 小时宽限期"
-
-        if not expire_time and reservation.confirmed_at:
-            confirmed_deadline = reservation.confirmed_at + timedelta(hours=rule.confirmed_expire_hours)
-            if now >= confirmed_deadline:
-                expire_time = confirmed_deadline
-                expire_reason = f"已确认后超过 {rule.confirmed_expire_hours} 小时未发放"
-
-    if not expire_time and reservation.status == ReservationStatus.PENDING:
-        pending_deadline = reservation.reserved_at + timedelta(hours=rule.pending_expire_hours)
-        if now >= pending_deadline:
-            expire_time = pending_deadline
-            expire_reason = f"待确认超过 {rule.pending_expire_hours} 小时未处理"
-
-    if expire_time:
-        return ReservationExpireStatus.EXPIRED_UNHANDLED, False, expire_reason
+    if effective_expire_time and now >= effective_expire_time:
+        return ReservationExpireStatus.EXPIRED_UNHANDLED, False, effective_reason
 
     is_expire_soon = False
-    if reservation.expired_at:
+    if effective_expire_time:
         soon_threshold = now + timedelta(hours=rule.expire_soon_hours)
-        if reservation.expired_at <= soon_threshold and reservation.expired_at > now:
+        if effective_expire_time <= soon_threshold and effective_expire_time > now:
             is_expire_soon = True
 
     return ReservationExpireStatus.NORMAL, is_expire_soon, None
@@ -1451,7 +1469,13 @@ def create_reservation(
     )
 
     now = datetime.utcnow()
-    expired_at = now + timedelta(hours=RESERVATION_EXPIRE_HOURS)
+    rule = get_active_expire_rule(db)
+
+    expired_at_candidates = []
+    if data.expected_use_time:
+        expired_at_candidates.append(data.expected_use_time + timedelta(hours=rule.expected_use_grace_hours))
+    expired_at_candidates.append(now + timedelta(hours=rule.pending_expire_hours))
+    expired_at = min(expired_at_candidates)
 
     reservation = Reservation(
         stool_id=stool.id,
@@ -1693,10 +1717,17 @@ def confirm_reservation(
 
     old_status = reservation.status
     now = datetime.utcnow()
+    rule = get_active_expire_rule(db)
 
     reservation.status = ReservationStatus.CONFIRMED
     reservation.confirmed_at = now
     reservation.confirmed_by = data.confirmed_by.strip()
+
+    confirmed_expire_candidates = []
+    if reservation.expected_use_time:
+        confirmed_expire_candidates.append(reservation.expected_use_time + timedelta(hours=rule.expected_use_grace_hours))
+    confirmed_expire_candidates.append(now + timedelta(hours=rule.confirmed_expire_hours))
+    reservation.expired_at = min(confirmed_expire_candidates)
 
     stool.status = StoolStatus.RESERVED
     stool.updated_at = now
@@ -1805,17 +1836,8 @@ def process_expired_reservations(db: Session) -> dict:
 
     to_expire = []
     for res in candidates:
-        expire_reason = None
-
-        if res.expired_at and res.expired_at <= now:
-            hours_since_expire = round((now - res.expired_at).total_seconds() / 3600, 2)
-            expire_reason = f"预约已超过过期时间，已过期 {hours_since_expire} 小时"
-        else:
-            _, _, rule_reason = calculate_reservation_expire_status(db, res)
-            if rule_reason:
-                expire_reason = rule_reason
-
-        if expire_reason:
+        expire_status, _, expire_reason = calculate_reservation_expire_status(db, res)
+        if expire_status == ReservationExpireStatus.EXPIRED_UNHANDLED and expire_reason:
             to_expire.append((res, expire_reason))
 
     for reservation, expire_reason in to_expire:

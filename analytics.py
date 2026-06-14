@@ -5,7 +5,7 @@ from sqlalchemy import func, and_
 
 from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult, Reservation, ReservationStatus, ReservationExpireStatus
 from schemas import AlertItem, TurnoverDistributionItem, AbnormalAreaItem
-from crud import calculate_reservation_expire_status, get_active_expire_rule
+from crud import calculate_reservation_expire_status, get_active_expire_rule, get_reservation_effective_expire_time
 
 
 LONG_BORROW_HOURS = 72
@@ -462,26 +462,28 @@ def detect_reservation_expire_soon_alerts(db: Session) -> List[AlertItem]:
 
     for res in active_reservations:
         expire_status, is_expire_soon, _ = calculate_reservation_expire_status(db, res)
-        if is_expire_soon and res.expired_at:
-            hours_until_expire = round((res.expired_at - now).total_seconds() / 3600, 1)
-            severity = "medium" if hours_until_expire <= 1 else "low"
+        if is_expire_soon:
+            effective_expire_time, _ = get_reservation_effective_expire_time(db, res)
+            if effective_expire_time:
+                hours_until_expire = round((effective_expire_time - now).total_seconds() / 3600, 1)
+                severity = "medium" if hours_until_expire <= 1 else "low"
 
-            alerts.append(AlertItem(
-                alert_type="预约即将过期",
-                severity=severity,
-                message=f"座凳 {res.stool_number} 的预约将在 {hours_until_expire} 小时后过期",
-                related_id=res.id,
-                related_stool_number=res.stool_number,
-                details={
-                    "reservation_id": res.id,
-                    "applicant": res.applicant,
-                    "status": res.status.value,
-                    "expired_at": res.expired_at.isoformat() if res.expired_at else None,
-                    "hours_until_expire": hours_until_expire,
-                    "storage_area": res.storage_area,
-                    "load_level": res.load_level.value
-                }
-            ))
+                alerts.append(AlertItem(
+                    alert_type="预约即将过期",
+                    severity=severity,
+                    message=f"座凳 {res.stool_number} 的预约将在 {hours_until_expire} 小时后过期",
+                    related_id=res.id,
+                    related_stool_number=res.stool_number,
+                    details={
+                        "reservation_id": res.id,
+                        "applicant": res.applicant,
+                        "status": res.status.value,
+                        "expired_at": effective_expire_time.isoformat() if effective_expire_time else None,
+                        "hours_until_expire": hours_until_expire,
+                        "storage_area": res.storage_area,
+                        "load_level": res.load_level.value
+                    }
+                ))
 
     return alerts
 
@@ -491,14 +493,19 @@ def detect_reservation_expired_unhandled_alerts(db: Session) -> List[AlertItem]:
     now = datetime.utcnow()
 
     expired_reservations = db.query(Reservation).filter(
-        Reservation.status == ReservationStatus.EXPIRED,
-        Reservation.expired_processed_at.is_(None)
+        Reservation.status.in_([ReservationStatus.EXPIRED, ReservationStatus.PENDING, ReservationStatus.CONFIRMED])
     ).all()
 
     for res in expired_reservations:
-        _, _, expire_reason = calculate_reservation_expire_status(db, res)
+        expire_status, _, expire_reason = calculate_reservation_expire_status(db, res)
+        if expire_status != ReservationExpireStatus.EXPIRED_UNHANDLED:
+            continue
+
+        effective_expire_time, _ = get_reservation_effective_expire_time(db, res)
         hours_expired = 0
-        if res.expired_at:
+        if effective_expire_time:
+            hours_expired = round((now - effective_expire_time).total_seconds() / 3600, 1)
+        elif res.expired_at:
             hours_expired = round((now - res.expired_at).total_seconds() / 3600, 1)
 
         severity = "high" if hours_expired >= 24 else "medium" if hours_expired >= 12 else "low"
@@ -512,7 +519,7 @@ def detect_reservation_expired_unhandled_alerts(db: Session) -> List[AlertItem]:
             details={
                 "reservation_id": res.id,
                 "applicant": res.applicant,
-                "expired_at": res.expired_at.isoformat() if res.expired_at else None,
+                "expired_at": effective_expire_time.isoformat() if effective_expire_time else (res.expired_at.isoformat() if res.expired_at else None),
                 "hours_expired": hours_expired,
                 "expire_reason": expire_reason,
                 "stool_status": None,
