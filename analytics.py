@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
-from models import Stool, BorrowRecord, StoolStatus, LoadLevel
+from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult
 from schemas import AlertItem, TurnoverDistributionItem, AbnormalAreaItem
 
 
@@ -151,12 +151,142 @@ def detect_unreviewed_reissue_risks(db: Session) -> List[AlertItem]:
     return alerts
 
 
+def detect_inspection_overdue_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_24h = now - timedelta(hours=24)
+    threshold_3d = now - timedelta(days=3)
+    threshold_7d = now - timedelta(days=7)
+
+    pending_tasks = db.query(InspectionTask).filter(
+        InspectionTask.task_status.in_([
+            InspectionTaskStatus.PENDING,
+            InspectionTaskStatus.IN_PROGRESS
+        ])
+    ).all()
+
+    for task in pending_tasks:
+        hours_overdue = round((now - task.scheduled_at).total_seconds() / 3600, 1)
+        if hours_overdue <= 0:
+            continue
+
+        if task.scheduled_at <= threshold_7d:
+            severity = "high"
+        elif task.scheduled_at <= threshold_3d:
+            severity = "medium"
+        elif task.scheduled_at <= threshold_24h:
+            severity = "low"
+        else:
+            continue
+
+        alerts.append(AlertItem(
+            alert_type="巡检任务超期",
+            severity=severity,
+            message=f"座凳 {task.stool_number} 的巡检任务已超期 {hours_overdue} 小时未处理",
+            related_id=task.id,
+            related_stool_number=task.stool_number,
+            details={
+                "task_id": task.id,
+                "storage_area": task.storage_area,
+                "responsible_person": task.responsible_person,
+                "scheduled_at": task.scheduled_at.isoformat() if task.scheduled_at else None,
+                "hours_overdue": hours_overdue,
+                "source_type": task.source_type
+            }
+        ))
+    return alerts
+
+
+def detect_inspection_pending_review_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_24h = now - timedelta(hours=24)
+    threshold_3d = now - timedelta(days=3)
+
+    pending_review_tasks = db.query(InspectionTask).filter(
+        InspectionTask.task_status == InspectionTaskStatus.ABNORMAL_PENDING_REVIEW
+    ).all()
+
+    for task in pending_review_tasks:
+        if not task.inspected_at:
+            continue
+        hours_pending = round((now - task.inspected_at).total_seconds() / 3600, 1)
+
+        if task.inspected_at <= threshold_3d:
+            severity = "high"
+        elif task.inspected_at <= threshold_24h:
+            severity = "medium"
+        else:
+            severity = "low"
+
+        alerts.append(AlertItem(
+            alert_type="巡检异常待复核",
+            severity=severity,
+            message=f"座凳 {task.stool_number} 巡检异常已待复核 {hours_pending} 小时",
+            related_id=task.id,
+            related_stool_number=task.stool_number,
+            details={
+                "task_id": task.id,
+                "storage_area": task.storage_area,
+                "responsible_person": task.responsible_person,
+                "inspected_at": task.inspected_at.isoformat() if task.inspected_at else None,
+                "appearance_issue": task.appearance_issue,
+                "appearance_issue_level": task.appearance_issue_level,
+                "hours_pending": hours_pending
+            }
+        ))
+    return alerts
+
+
+def detect_inspection_detained_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_7d = now - timedelta(days=7)
+    threshold_14d = now - timedelta(days=14)
+
+    detained_tasks = db.query(InspectionTask).filter(
+        InspectionTask.task_status == InspectionTaskStatus.ABNORMAL_DETAINED
+    ).all()
+
+    for task in detained_tasks:
+        if not task.detained_at:
+            continue
+        days_detained = round((now - task.detained_at).total_seconds() / 86400, 1)
+
+        if task.detained_at <= threshold_14d:
+            severity = "high"
+        elif task.detained_at <= threshold_7d:
+            severity = "medium"
+        else:
+            severity = "low"
+
+        alerts.append(AlertItem(
+            alert_type="巡检异常留置超时",
+            severity=severity,
+            message=f"座凳 {task.stool_number} 因巡检异常已留置 {days_detained} 天",
+            related_id=task.id,
+            related_stool_number=task.stool_number,
+            details={
+                "task_id": task.id,
+                "storage_area": task.storage_area,
+                "responsible_person": task.responsible_person,
+                "detained_at": task.detained_at.isoformat() if task.detained_at else None,
+                "detained_reason": task.detained_reason,
+                "days_detained": days_detained
+            }
+        ))
+    return alerts
+
+
 def get_all_alerts(db: Session, alert_type: Optional[str] = None, severity: Optional[str] = None) -> List[AlertItem]:
     all_alerts = []
     all_alerts.extend(detect_long_borrow_alerts(db))
     all_alerts.extend(detect_high_load_wear_alerts(db))
     all_alerts.extend(detect_area_consecutive_issues(db))
     all_alerts.extend(detect_unreviewed_reissue_risks(db))
+    all_alerts.extend(detect_inspection_overdue_alerts(db))
+    all_alerts.extend(detect_inspection_pending_review_alerts(db))
+    all_alerts.extend(detect_inspection_detained_alerts(db))
 
     if alert_type:
         all_alerts = [a for a in all_alerts if a.alert_type == alert_type]
@@ -242,6 +372,13 @@ def get_abnormal_areas(
 
     all_records = base_query.all()
 
+    inspection_query = db.query(InspectionTask)
+    if date_from:
+        inspection_query = inspection_query.filter(InspectionTask.created_at >= date_from)
+    if date_to:
+        inspection_query = inspection_query.filter(InspectionTask.created_at <= date_to)
+    all_inspection_tasks = inspection_query.all()
+
     area_stats = {}
     for rec in all_records:
         area = rec.stool.storage_area
@@ -249,9 +386,13 @@ def get_abnormal_areas(
             area_stats[area] = {
                 "total": 0,
                 "abnormal": 0,
-                "recent_abnormal": 0
+                "recent_abnormal": 0,
+                "borrow_total": 0,
+                "inspection_total": 0,
+                "inspection_abnormal": 0
             }
         area_stats[area]["total"] += 1
+        area_stats[area]["borrow_total"] += 1
         is_abnormal = (
             rec.is_detained == 1
             or (rec.appearance_issue_level in ["严重"])
@@ -260,6 +401,30 @@ def get_abnormal_areas(
         if is_abnormal:
             area_stats[area]["abnormal"] += 1
             if rec.created_at >= recent_window:
+                area_stats[area]["recent_abnormal"] += 1
+
+    for task in all_inspection_tasks:
+        area = task.storage_area
+        if area not in area_stats:
+            area_stats[area] = {
+                "total": 0,
+                "abnormal": 0,
+                "recent_abnormal": 0,
+                "borrow_total": 0,
+                "inspection_total": 0,
+                "inspection_abnormal": 0
+            }
+        area_stats[area]["total"] += 1
+        area_stats[area]["inspection_total"] += 1
+        is_abnormal = (
+            task.inspection_result == InspectionResult.ABNORMAL
+            or task.is_detained == 1
+            or task.task_status == InspectionTaskStatus.ABNORMAL_DETAINED
+        )
+        if is_abnormal:
+            area_stats[area]["abnormal"] += 1
+            area_stats[area]["inspection_abnormal"] += 1
+            if task.created_at >= recent_window:
                 area_stats[area]["recent_abnormal"] += 1
 
     items = []

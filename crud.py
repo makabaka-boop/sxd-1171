@@ -1,13 +1,20 @@
 from datetime import datetime, timedelta
 from typing import Optional, List
+import json
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
-from models import Stool, BorrowRecord, StoolStatus, LoadLevel
+from models import (
+    Stool, BorrowRecord, StoolStatus, LoadLevel,
+    InspectionTask, InspectionTaskStatus, InspectionResult,
+    InspectionTaskLog
+)
 from schemas import (
     StoolCreate, StoolUpdate,
     IssueStoolRequest, ReturnStoolRequest,
-    CleanStoolRequest, ReviewStoolRequest, DetainStoolRequest
+    CleanStoolRequest, ReviewStoolRequest, DetainStoolRequest,
+    GenerateInspectionTasksRequest, SubmitInspectionResultRequest,
+    ReviewInspectionTaskRequest, RestoreInspectedStoolRequest
 )
 from exceptions import ValidationException, StatusConflictException, NotFoundException
 
@@ -505,3 +512,415 @@ def enrich_records(records: List[BorrowRecord], db: Session) -> List[dict]:
             enriched["stool_number"] = stool.stool_number
         result.append(enriched)
     return result
+
+
+def add_inspection_log(
+    db: Session,
+    task_id: int,
+    action_type: str,
+    action_by: str,
+    description: str = None,
+    from_status: str = None,
+    to_status: str = None,
+    details: dict = None
+) -> InspectionTaskLog:
+    log = InspectionTaskLog(
+        task_id=task_id,
+        action_type=action_type,
+        action_by=action_by.strip(),
+        description=description,
+        from_status=from_status,
+        to_status=to_status,
+        details=json.dumps(details, ensure_ascii=False) if details else None
+    )
+    db.add(log)
+    db.flush()
+    return log
+
+
+def get_last_inspection_time(db: Session, stool_id: int) -> Optional[datetime]:
+    last_task = db.query(InspectionTask).filter(
+        InspectionTask.stool_id == stool_id,
+        InspectionTask.inspected_at.isnot(None),
+        InspectionTask.task_status.in_([
+            InspectionTaskStatus.COMPLETED_NORMAL,
+            InspectionTaskStatus.COMPLETED_ABNORMAL,
+            InspectionTaskStatus.ABNORMAL_DETAINED,
+            InspectionTaskStatus.ABNORMAL_PENDING_REVIEW,
+            InspectionTaskStatus.CLOSED
+        ])
+    ).order_by(InspectionTask.inspected_at.desc()).first()
+    return last_task.inspected_at if last_task else None
+
+
+def generate_inspection_tasks(db: Session, source_type: str = "周期巡检") -> List[InspectionTask]:
+    now = datetime.utcnow()
+    created_tasks = []
+
+    stools = db.query(Stool).filter(
+        Stool.status.in_([
+            StoolStatus.PENDING_ISSUE,
+            StoolStatus.RESTORED
+        ])
+    ).all()
+
+    for stool in stools:
+        last_inspected_at = get_last_inspection_time(db, stool.id)
+
+        if last_inspected_at:
+            next_inspection_date = last_inspected_at + timedelta(days=stool.inspection_cycle_days)
+            if next_inspection_date > now:
+                continue
+
+        pending_task = db.query(InspectionTask).filter(
+            InspectionTask.stool_id == stool.id,
+            InspectionTask.task_status.in_([
+                InspectionTaskStatus.PENDING,
+                InspectionTaskStatus.IN_PROGRESS
+            ])
+        ).first()
+        if pending_task:
+            continue
+
+        task = InspectionTask(
+            stool_id=stool.id,
+            stool_number=stool.stool_number,
+            storage_area=stool.storage_area,
+            load_level=stool.load_level,
+            responsible_person=stool.responsible_person,
+            task_status=InspectionTaskStatus.PENDING,
+            inspection_cycle_days=stool.inspection_cycle_days,
+            last_inspection_at=last_inspected_at,
+            scheduled_at=now,
+            source_type=source_type
+        )
+        db.add(task)
+        db.flush()
+
+        add_inspection_log(
+            db, task.id, "任务生成", "system",
+            description=f"系统自动生成巡检任务，来源：{source_type}",
+            from_status=None,
+            to_status=InspectionTaskStatus.PENDING.value,
+            details={"stool_number": stool.stool_number, "source_type": source_type}
+        )
+
+        created_tasks.append(task)
+
+    db.commit()
+    for task in created_tasks:
+        db.refresh(task)
+    return created_tasks
+
+
+def get_inspection_task(db: Session, task_id: int) -> Optional[InspectionTask]:
+    return db.query(InspectionTask).filter(InspectionTask.id == task_id).first()
+
+
+def list_inspection_tasks(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    storage_area: Optional[str] = None,
+    responsible_person: Optional[str] = None,
+    task_status: Optional[InspectionTaskStatus] = None,
+    load_level: Optional[LoadLevel] = None,
+    source_type: Optional[str] = None,
+    is_abnormal: Optional[bool] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None
+):
+    query = db.query(InspectionTask)
+
+    if storage_area:
+        query = query.filter(InspectionTask.storage_area.like(f"%{storage_area}%"))
+    if responsible_person:
+        query = query.filter(InspectionTask.responsible_person.like(f"%{responsible_person}%"))
+    if task_status:
+        query = query.filter(InspectionTask.task_status == task_status)
+    if load_level:
+        query = query.filter(InspectionTask.load_level == load_level)
+    if source_type:
+        query = query.filter(InspectionTask.source_type == source_type)
+    if is_abnormal is not None:
+        if is_abnormal:
+            query = query.filter(InspectionTask.inspection_result == InspectionResult.ABNORMAL)
+        else:
+            query = query.filter(
+                or_(
+                    InspectionTask.inspection_result == InspectionResult.NORMAL,
+                    InspectionTask.inspection_result.is_(None)
+                )
+            )
+    if date_from:
+        query = query.filter(InspectionTask.created_at >= date_from)
+    if date_to:
+        query = query.filter(InspectionTask.created_at <= date_to)
+
+    total = query.count()
+    items = query.order_by(InspectionTask.created_at.desc()).offset(skip).limit(limit).all()
+    return total, items
+
+
+def submit_inspection_result(db: Session, data: SubmitInspectionResultRequest) -> InspectionTask:
+    task = get_inspection_task(db, data.task_id)
+    if not task:
+        raise NotFoundException("巡检任务", str(data.task_id))
+
+    if task.task_status not in [InspectionTaskStatus.PENDING, InspectionTaskStatus.IN_PROGRESS]:
+        raise StatusConflictException(
+            f"巡检任务当前状态为「{task.task_status.value}」，不可提交巡检结果",
+            current_status=task.task_status.value,
+            expected_status=f"{InspectionTaskStatus.PENDING.value} 或 {InspectionTaskStatus.IN_PROGRESS.value}"
+        )
+
+    stool = get_stool(db, task.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(task.stool_id))
+
+    now = datetime.utcnow()
+    old_status = task.task_status
+
+    task.inspection_result = data.inspection_result
+    task.inspected_by = data.inspected_by.strip()
+    task.inspected_at = now
+
+    if data.appearance_issue:
+        task.appearance_issue = data.appearance_issue.strip()
+    if data.appearance_issue_level:
+        task.appearance_issue_level = data.appearance_issue_level.strip()
+    if data.handling_suggestion:
+        task.handling_suggestion = data.handling_suggestion.strip()
+
+    if data.inspection_result == InspectionResult.NORMAL:
+        task.task_status = InspectionTaskStatus.COMPLETED_NORMAL
+        stool.status = StoolStatus.RESTORED
+
+        add_inspection_log(
+            db, task.id, "提交巡检结果", data.inspected_by,
+            description="巡检结果正常，座凳恢复可用状态",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.COMPLETED_NORMAL.value,
+            details={"inspection_result": "正常"}
+        )
+    else:
+        abnormal_action = data.abnormal_action or "待复核"
+
+        if abnormal_action == "留置":
+            task.task_status = InspectionTaskStatus.ABNORMAL_DETAINED
+            task.is_detained = 1
+            task.detained_at = now
+            task.detained_by = data.inspected_by.strip()
+            task.detained_reason = f"巡检异常留置: {data.appearance_issue or '外观异常'}"
+            stool.status = StoolStatus.DETAINED
+
+            add_inspection_log(
+                db, task.id, "提交巡检结果", data.inspected_by,
+                description="巡检发现异常，座凳已异常留置",
+                from_status=old_status.value,
+                to_status=InspectionTaskStatus.ABNORMAL_DETAINED.value,
+                details={
+                    "inspection_result": "异常",
+                    "abnormal_action": "留置",
+                    "appearance_issue": data.appearance_issue,
+                    "appearance_issue_level": data.appearance_issue_level
+                }
+            )
+        else:
+            task.task_status = InspectionTaskStatus.ABNORMAL_PENDING_REVIEW
+            stool.status = StoolStatus.PENDING_INSPECTION_REVIEW
+
+            add_inspection_log(
+                db, task.id, "提交巡检结果", data.inspected_by,
+                description="巡检发现异常，进入待复核流程",
+                from_status=old_status.value,
+                to_status=InspectionTaskStatus.ABNORMAL_PENDING_REVIEW.value,
+                details={
+                    "inspection_result": "异常",
+                    "abnormal_action": "待复核",
+                    "appearance_issue": data.appearance_issue,
+                    "appearance_issue_level": data.appearance_issue_level,
+                    "handling_suggestion": data.handling_suggestion
+                }
+            )
+
+    task.updated_at = now
+    stool.updated_at = now
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def review_inspection_task(db: Session, data: ReviewInspectionTaskRequest) -> InspectionTask:
+    task = get_inspection_task(db, data.task_id)
+    if not task:
+        raise NotFoundException("巡检任务", str(data.task_id))
+
+    if task.task_status != InspectionTaskStatus.ABNORMAL_PENDING_REVIEW:
+        raise StatusConflictException(
+            f"巡检任务当前状态为「{task.task_status.value}」，不可执行复核",
+            current_status=task.task_status.value,
+            expected_status=InspectionTaskStatus.ABNORMAL_PENDING_REVIEW.value
+        )
+
+    stool = get_stool(db, task.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(task.stool_id))
+
+    valid_results = ["恢复可用", "需留置", "再次巡检"]
+    if data.review_result not in valid_results:
+        raise ValidationException(
+            f"复核结果必须为 {valid_results} 之一",
+            "review_result"
+        )
+
+    now = datetime.utcnow()
+    old_status = task.task_status
+
+    task.reviewed_by = data.reviewed_by.strip()
+    task.reviewed_at = now
+    task.review_result = data.review_result.strip()
+    if data.review_note:
+        task.review_note = data.review_note.strip()
+
+    if data.review_result == "恢复可用":
+        task.task_status = InspectionTaskStatus.COMPLETED_ABNORMAL
+        stool.status = StoolStatus.RESTORED
+
+        add_inspection_log(
+            db, task.id, "复核完成", data.reviewed_by,
+            description="复核通过，座凳恢复可用",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.COMPLETED_ABNORMAL.value,
+            details={"review_result": "恢复可用", "review_note": data.review_note}
+        )
+    elif data.review_result == "需留置":
+        task.task_status = InspectionTaskStatus.ABNORMAL_DETAINED
+        task.is_detained = 1
+        task.detained_at = now
+        task.detained_by = data.reviewed_by.strip()
+        task.detained_reason = f"复核留置: {data.review_note or '复核未通过'}"
+        stool.status = StoolStatus.DETAINED
+
+        add_inspection_log(
+            db, task.id, "复核完成", data.reviewed_by,
+            description="复核未通过，座凳异常留置",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.ABNORMAL_DETAINED.value,
+            details={"review_result": "需留置", "review_note": data.review_note}
+        )
+    elif data.review_result == "再次巡检":
+        task.task_status = InspectionTaskStatus.IN_PROGRESS
+        task.inspected_at = None
+        task.inspected_by = None
+        task.inspection_result = None
+        task.appearance_issue = None
+        task.appearance_issue_level = None
+        task.handling_suggestion = None
+        task.reviewed_at = None
+        task.reviewed_by = None
+        task.review_result = None
+        task.review_note = None
+        stool.status = StoolStatus.PENDING_INSPECTION_REVIEW
+
+        add_inspection_log(
+            db, task.id, "复核完成", data.reviewed_by,
+            description="复核要求再次巡检",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.IN_PROGRESS.value,
+            details={"review_result": "再次巡检", "review_note": data.review_note}
+        )
+
+    task.updated_at = now
+    stool.updated_at = now
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def restore_inspected_stool(db: Session, data: RestoreInspectedStoolRequest) -> InspectionTask:
+    task = get_inspection_task(db, data.task_id)
+    if not task:
+        raise NotFoundException("巡检任务", str(data.task_id))
+
+    if task.task_status != InspectionTaskStatus.ABNORMAL_DETAINED:
+        raise StatusConflictException(
+            f"巡检任务当前状态为「{task.task_status.value}」，不可恢复",
+            current_status=task.task_status.value,
+            expected_status=InspectionTaskStatus.ABNORMAL_DETAINED.value
+        )
+
+    stool = get_stool(db, task.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(task.stool_id))
+
+    if stool.status != StoolStatus.DETAINED:
+        raise StatusConflictException(
+            f"座凳当前状态为「{stool.status.value}」，不可恢复",
+            current_status=stool.status.value,
+            expected_status=StoolStatus.DETAINED.value
+        )
+
+    now = datetime.utcnow()
+    old_status = task.task_status
+
+    task.task_status = InspectionTaskStatus.CLOSED
+    task.updated_at = now
+
+    stool.status = StoolStatus.RESTORED
+    stool.updated_at = now
+
+    add_inspection_log(
+        db, task.id, "恢复可用", data.restored_by,
+        description=f"座凳恢复可用状态，备注：{data.restore_note or '无'}",
+        from_status=old_status.value,
+        to_status=InspectionTaskStatus.CLOSED.value,
+        details={"restore_note": data.restore_note}
+    )
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def get_inspection_task_detail(db: Session, task_id: int) -> Optional[InspectionTask]:
+    task = db.query(InspectionTask).filter(InspectionTask.id == task_id).first()
+    if task:
+        _ = task.logs
+    return task
+
+
+def get_inspection_task_logs(db: Session, task_id: int) -> List[InspectionTaskLog]:
+    return db.query(InspectionTaskLog).filter(
+        InspectionTaskLog.task_id == task_id
+    ).order_by(InspectionTaskLog.action_at.asc()).all()
+
+
+def get_inspection_tasks_summary(db: Session) -> dict:
+    summary = {
+        "total_tasks": db.query(InspectionTask).count(),
+        "pending_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.PENDING
+        ).count(),
+        "in_progress_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.IN_PROGRESS
+        ).count(),
+        "completed_normal_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.COMPLETED_NORMAL
+        ).count(),
+        "completed_abnormal_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.COMPLETED_ABNORMAL
+        ).count(),
+        "abnormal_detained_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.ABNORMAL_DETAINED
+        ).count(),
+        "abnormal_pending_review_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.ABNORMAL_PENDING_REVIEW
+        ).count(),
+        "closed_count": db.query(InspectionTask).filter(
+            InspectionTask.task_status == InspectionTaskStatus.CLOSED
+        ).count(),
+    }
+    return summary

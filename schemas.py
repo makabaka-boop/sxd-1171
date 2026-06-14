@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
-from models import StoolStatus, LoadLevel
+from models import StoolStatus, LoadLevel, InspectionTaskStatus, InspectionResult
 
 
 class StoolBase(BaseModel):
@@ -164,3 +164,109 @@ class PendingReviewSummary(BaseModel):
     over_24h_count: int
     over_3d_count: int
     items: List[BorrowRecordResponse]
+
+
+class InspectionTaskBase(BaseModel):
+    pass
+
+
+class GenerateInspectionTasksRequest(BaseModel):
+    source_type: Optional[str] = Field("周期巡检", description="任务来源类型：周期巡检/专项巡检/其他")
+
+
+class SubmitInspectionResultRequest(BaseModel):
+    task_id: int = Field(..., description="巡检任务ID")
+    inspection_result: InspectionResult = Field(..., description="巡检结果：正常/异常")
+    inspected_by: str = Field(..., min_length=1, max_length=100, description="巡检操作人（值守人员）")
+    appearance_issue: Optional[str] = Field(None, description="外观问题描述")
+    appearance_issue_level: Optional[str] = Field(None, description="外观问题等级：轻微/一般/严重")
+    handling_suggestion: Optional[str] = Field(None, description="处理建议")
+    abnormal_action: Optional[str] = Field(None, description="异常处理方式：留置/待复核")
+
+
+class ReviewInspectionTaskRequest(BaseModel):
+    task_id: int = Field(..., description="巡检任务ID")
+    reviewed_by: str = Field(..., min_length=1, max_length=100, description="复核操作人")
+    review_result: str = Field(..., description="复核结果：恢复可用/需留置/再次巡检")
+    review_note: Optional[str] = Field(None, description="复核备注")
+
+
+class RestoreInspectedStoolRequest(BaseModel):
+    task_id: int = Field(..., description="巡检任务ID")
+    restored_by: str = Field(..., min_length=1, max_length=100, description="恢复操作人")
+    restore_note: Optional[str] = Field(None, description="恢复备注")
+
+
+class InspectionTaskLogResponse(BaseModel):
+    id: int
+    task_id: int
+    action_type: str
+    action_by: str
+    action_at: datetime
+    description: Optional[str] = None
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    details: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionTaskResponse(BaseModel):
+    id: int
+    stool_id: int
+    stool_number: str
+    storage_area: str
+    load_level: LoadLevel
+    responsible_person: str
+
+    task_status: InspectionTaskStatus
+    inspection_cycle_days: int
+    last_inspection_at: Optional[datetime] = None
+    scheduled_at: datetime
+
+    inspection_result: Optional[InspectionResult] = None
+    inspected_by: Optional[str] = None
+    inspected_at: Optional[datetime] = None
+    appearance_issue: Optional[str] = None
+    appearance_issue_level: Optional[str] = None
+    handling_suggestion: Optional[str] = None
+
+    is_detained: int = 0
+    detained_reason: Optional[str] = None
+    detained_at: Optional[datetime] = None
+    detained_by: Optional[str] = None
+
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    review_result: Optional[str] = None
+    review_note: Optional[str] = None
+
+    source_type: str
+    source_record_id: Optional[int] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionTaskDetailResponse(InspectionTaskResponse):
+    logs: List[InspectionTaskLogResponse] = []
+
+
+class InspectionTaskListResponse(BaseModel):
+    total: int
+    items: List[InspectionTaskResponse]
+
+
+class InspectionTaskSummary(BaseModel):
+    total_tasks: int
+    pending_count: int
+    in_progress_count: int
+    completed_normal_count: int
+    completed_abnormal_count: int
+    abnormal_detained_count: int
+    abnormal_pending_review_count: int
+    closed_count: int

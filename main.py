@@ -6,19 +6,27 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from database import engine, get_db, Base
-from models import StoolStatus, LoadLevel, Stool, BorrowRecord
+from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult
 from schemas import (
     StoolCreate, StoolUpdate, StoolResponse, StoolListResponse,
     IssueStoolRequest, ReturnStoolRequest, CleanStoolRequest,
     ReviewStoolRequest, DetainStoolRequest, BorrowRecordResponse,
     BorrowRecordListResponse, AlertItem, AlertListResponse,
     TurnoverDistributionResponse, TurnoverDistributionItem,
-    AbnormalAreaItem, AbnormalAreaListResponse, PendingReviewSummary
+    AbnormalAreaItem, AbnormalAreaListResponse, PendingReviewSummary,
+    GenerateInspectionTasksRequest, SubmitInspectionResultRequest,
+    ReviewInspectionTaskRequest, RestoreInspectedStoolRequest,
+    InspectionTaskResponse, InspectionTaskListResponse,
+    InspectionTaskDetailResponse, InspectionTaskSummary,
+    InspectionTaskLogResponse
 )
 from crud import (
     create_stool, get_stool, list_stools, update_stool, delete_stool,
     issue_stool, return_stool, clean_stool, review_stool, detain_stool,
-    get_borrow_record, list_borrow_records, enrich_records
+    get_borrow_record, list_borrow_records, enrich_records,
+    generate_inspection_tasks, get_inspection_task, list_inspection_tasks,
+    submit_inspection_result, review_inspection_task, restore_inspected_stool,
+    get_inspection_task_detail, get_inspection_task_logs, get_inspection_tasks_summary
 )
 from analytics import (
     get_all_alerts, get_turnover_distribution,
@@ -271,6 +279,90 @@ def api_pending_review(
         over_3d_count=result["over_3d_count"],
         items=response_items
     )
+
+
+@app.post("/api/inspection/generate", tags=["巡检管理"], summary="生成巡检任务（管理者）")
+def api_generate_inspection_tasks(
+    data: GenerateInspectionTasksRequest = None,
+    db: Session = Depends(get_db)
+):
+    source_type = data.source_type if data else "周期巡检"
+    tasks = generate_inspection_tasks(db, source_type)
+    return {
+        "message": f"成功生成 {len(tasks)} 条巡检任务",
+        "generated_count": len(tasks),
+        "tasks": [InspectionTaskResponse.model_validate(t) for t in tasks]
+    }
+
+
+@app.get("/api/inspection/tasks", response_model=InspectionTaskListResponse, tags=["巡检管理"], summary="查询巡检任务列表")
+def api_list_inspection_tasks(
+    skip: int = Query(0, ge=0, description="跳过条数"),
+    limit: int = Query(100, ge=1, le=500, description="每页条数"),
+    storage_area: Optional[str] = Query(None, description="存放区域筛选（模糊匹配）"),
+    responsible_person: Optional[str] = Query(None, description="责任人筛选（模糊匹配）"),
+    task_status: Optional[InspectionTaskStatus] = Query(None, description="任务状态筛选"),
+    load_level: Optional[LoadLevel] = Query(None, description="承载等级筛选"),
+    source_type: Optional[str] = Query(None, description="任务来源类型筛选"),
+    is_abnormal: Optional[bool] = Query(None, description="是否异常"),
+    date_from: Optional[str] = Query(None, description="创建时间起（YYYY-MM-DD）"),
+    date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
+    db: Session = Depends(get_db)
+):
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
+    if dt_to and date_to and len(date_to) == 10:
+        dt_to = dt_to.replace(hour=23, minute=59, second=59)
+
+    total, items = list_inspection_tasks(
+        db, skip, limit, storage_area, responsible_person,
+        task_status, load_level, source_type, is_abnormal, dt_from, dt_to
+    )
+    return InspectionTaskListResponse(total=total, items=items)
+
+
+@app.get("/api/inspection/tasks/{task_id}", response_model=InspectionTaskDetailResponse, tags=["巡检管理"], summary="查询巡检任务详情")
+def api_get_inspection_task(task_id: int, db: Session = Depends(get_db)):
+    task = get_inspection_task_detail(db, task_id)
+    if not task:
+        raise NotFoundException("巡检任务", str(task_id))
+    return InspectionTaskDetailResponse.model_validate(task)
+
+
+@app.get("/api/inspection/tasks/{task_id}/logs", tags=["巡检管理"], summary="查询巡检任务处理记录")
+def api_get_inspection_task_logs(task_id: int, db: Session = Depends(get_db)):
+    task = get_inspection_task(db, task_id)
+    if not task:
+        raise NotFoundException("巡检任务", str(task_id))
+    logs = get_inspection_task_logs(db, task_id)
+    return {
+        "total": len(logs),
+        "items": [InspectionTaskLogResponse.model_validate(log) for log in logs]
+    }
+
+
+@app.post("/api/inspection/submit", response_model=InspectionTaskResponse, tags=["巡检管理"], summary="提交巡检结果（值守人员）")
+def api_submit_inspection_result(data: SubmitInspectionResultRequest, db: Session = Depends(get_db)):
+    task = submit_inspection_result(db, data)
+    return InspectionTaskResponse.model_validate(task)
+
+
+@app.post("/api/inspection/review", response_model=InspectionTaskResponse, tags=["巡检管理"], summary="复核巡检异常（复核人员）")
+def api_review_inspection_task(data: ReviewInspectionTaskRequest, db: Session = Depends(get_db)):
+    task = review_inspection_task(db, data)
+    return InspectionTaskResponse.model_validate(task)
+
+
+@app.post("/api/inspection/restore", response_model=InspectionTaskResponse, tags=["巡检管理"], summary="恢复异常留置座凳（管理者）")
+def api_restore_inspected_stool(data: RestoreInspectedStoolRequest, db: Session = Depends(get_db)):
+    task = restore_inspected_stool(db, data)
+    return InspectionTaskResponse.model_validate(task)
+
+
+@app.get("/api/inspection/summary", response_model=InspectionTaskSummary, tags=["巡检管理"], summary="巡检任务统计概览")
+def api_inspection_summary(db: Session = Depends(get_db)):
+    summary = get_inspection_tasks_summary(db)
+    return InspectionTaskSummary(**summary)
 
 
 if __name__ == "__main__":
