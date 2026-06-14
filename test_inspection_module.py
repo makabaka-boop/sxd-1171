@@ -44,7 +44,7 @@ def db():
             os.remove("./test_inspection.db")
 
 
-def create_test_stool(db, number="STOOL-001", area="A区", level=LoadLevel.MEDIUM, cycle=7, person="张三"):
+def create_test_stool(db, number="STOOL-001", area="A区", level=LoadLevel.MEDIUM, cycle=1, person="张三", created_days_ago=2):
     data = StoolCreate(
         stool_number=number,
         storage_area=area,
@@ -52,7 +52,13 @@ def create_test_stool(db, number="STOOL-001", area="A区", level=LoadLevel.MEDIU
         inspection_cycle_days=cycle,
         responsible_person=person
     )
-    return create_stool(db, data)
+    stool = create_stool(db, data)
+    old_time = datetime.utcnow() - timedelta(days=created_days_ago)
+    stool.created_at = old_time
+    stool.updated_at = old_time
+    db.commit()
+    db.refresh(stool)
+    return stool
 
 
 class TestInspectionTaskGeneration:
@@ -81,7 +87,7 @@ class TestInspectionTaskGeneration:
         assert len(tasks) == 0
 
     def test_generate_inspection_tasks_after_cycle(self, db):
-        stool = create_test_stool(db, "STOOL-001", cycle=1)
+        stool = create_test_stool(db, "STOOL-001", cycle=1, created_days_ago=2)
 
         tasks = generate_inspection_tasks(db)
         assert len(tasks) == 1
@@ -99,6 +105,12 @@ class TestInspectionTaskGeneration:
 
         tasks2 = generate_inspection_tasks(db)
         assert len(tasks2) == 0
+
+        task.inspected_at = datetime.utcnow() - timedelta(days=2)
+        db.commit()
+
+        tasks3 = generate_inspection_tasks(db)
+        assert len(tasks3) == 1
 
     def test_generate_with_source_type(self, db):
         create_test_stool(db, "STOOL-001")

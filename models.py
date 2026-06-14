@@ -15,6 +15,15 @@ class StoolStatus(str, enum.Enum):
     DETAINED = "异常留置"
     PENDING_INSPECTION = "待巡检"
     PENDING_INSPECTION_REVIEW = "待巡检复核"
+    RESERVED = "已预约"
+
+
+class ReservationStatus(str, enum.Enum):
+    PENDING = "待确认"
+    CONFIRMED = "已确认"
+    CANCELLED = "已取消"
+    EXPIRED = "已过期"
+    COMPLETED = "已完成"
 
 
 class UserRole(str, enum.Enum):
@@ -59,6 +68,7 @@ class Stool(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     borrow_records = relationship("BorrowRecord", back_populates="stool", cascade="all, delete-orphan")
+    reservations = relationship("Reservation", back_populates="stool", cascade="all, delete-orphan")
 
 
 class BorrowRecord(Base):
@@ -95,10 +105,66 @@ class BorrowRecord(Base):
     turnover_hours = Column(Float, nullable=True)
     source_type = Column(String(50), default="借还流程", nullable=False)
     source_task_id = Column(Integer, nullable=True)
+    source_reservation_id = Column(Integer, nullable=True, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     stool = relationship("Stool", back_populates="borrow_records")
+    reservation = relationship("Reservation", back_populates="borrow_record")
+
+
+class Reservation(Base):
+    __tablename__ = "reservations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stool_id = Column(Integer, ForeignKey("stools.id"), nullable=False, index=True)
+    stool_number = Column(String(50), index=True, nullable=False)
+    storage_area = Column(String(100), nullable=False, index=True)
+    load_level = Column(Enum(LoadLevel), nullable=False, index=True)
+
+    applicant = Column(String(100), nullable=False, index=True)
+    applicant_contact = Column(String(100), nullable=True)
+    purpose = Column(Text, nullable=True)
+
+    status = Column(Enum(ReservationStatus), default=ReservationStatus.PENDING, nullable=False, index=True)
+    queue_position = Column(Integer, nullable=True, index=True)
+    priority_score = Column(Float, default=0.0, nullable=False, index=True)
+
+    reserved_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expected_use_time = Column(DateTime, nullable=True)
+    expired_at = Column(DateTime, nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    confirmed_by = Column(String(100), nullable=True)
+
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String(100), nullable=True)
+    cancel_reason = Column(Text, nullable=True)
+
+    completed_at = Column(DateTime, nullable=True)
+    borrow_record_id = Column(Integer, ForeignKey("borrow_records.id"), nullable=True, index=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    stool = relationship("Stool")
+    borrow_record = relationship("BorrowRecord", back_populates="reservation")
+    logs = relationship("ReservationLog", back_populates="reservation", cascade="all, delete-orphan")
+
+
+class ReservationLog(Base):
+    __tablename__ = "reservation_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reservation_id = Column(Integer, ForeignKey("reservations.id"), nullable=False, index=True)
+    action_type = Column(String(50), nullable=False)
+    action_by = Column(String(100), nullable=False)
+    action_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    description = Column(Text, nullable=True)
+    from_status = Column(String(50), nullable=True)
+    to_status = Column(String(50), nullable=True)
+    details = Column(Text, nullable=True)
+
+    reservation = relationship("Reservation", back_populates="logs")
 
 
 class InspectionTask(Base):

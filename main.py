@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import engine, get_db, Base
-from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult
+from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult, ReservationStatus
 from schemas import (
     StoolCreate, StoolUpdate, StoolResponse, StoolListResponse,
     IssueStoolRequest, ReturnStoolRequest, CleanStoolRequest,
@@ -19,7 +19,12 @@ from schemas import (
     ReviewInspectionTaskRequest, RestoreInspectedStoolRequest,
     InspectionTaskResponse, InspectionTaskListResponse,
     InspectionTaskDetailResponse, InspectionTaskSummary,
-    InspectionTaskLogResponse
+    InspectionTaskLogResponse,
+    CreateReservationRequest, CancelReservationRequest,
+    ConfirmReservationRequest, IssueByReservationRequest,
+    ReservationResponse, ReservationListResponse,
+    ReservationDetailResponse, ReservationSummary,
+    ReservationLogResponse
 )
 from crud import (
     create_stool, get_stool, list_stools, update_stool, delete_stool,
@@ -27,7 +32,11 @@ from crud import (
     get_borrow_record, list_borrow_records, enrich_records,
     generate_inspection_tasks, get_inspection_task, list_inspection_tasks,
     submit_inspection_result, review_inspection_task, restore_inspected_stool,
-    get_inspection_task_detail, get_inspection_task_logs, get_inspection_tasks_summary
+    get_inspection_task_detail, get_inspection_task_logs, get_inspection_tasks_summary,
+    create_reservation, get_reservation, get_reservation_detail,
+    list_reservations, cancel_reservation, confirm_reservation,
+    issue_by_reservation, expire_reservations, get_reservation_logs,
+    get_reservations_summary, enrich_reservation_records
 )
 from analytics import (
     get_all_alerts, get_turnover_distribution,
@@ -45,6 +54,66 @@ def ensure_compatible_schema():
             conn.execute(text("ALTER TABLE borrow_records ADD COLUMN source_type VARCHAR(50) DEFAULT '借还流程' NOT NULL"))
         if "source_task_id" not in columns:
             conn.execute(text("ALTER TABLE borrow_records ADD COLUMN source_task_id INTEGER"))
+        if "source_reservation_id" not in columns:
+            conn.execute(text("ALTER TABLE borrow_records ADD COLUMN source_reservation_id INTEGER"))
+
+        tables = {row[0] for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+        if "reservations" not in tables:
+            conn.execute(text("""
+                CREATE TABLE reservations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stool_id INTEGER NOT NULL,
+                    stool_number VARCHAR(50) NOT NULL,
+                    storage_area VARCHAR(100) NOT NULL,
+                    load_level VARCHAR(20) NOT NULL,
+                    applicant VARCHAR(100) NOT NULL,
+                    applicant_contact VARCHAR(100),
+                    purpose TEXT,
+                    status VARCHAR(20) NOT NULL DEFAULT '待确认',
+                    queue_position INTEGER,
+                    priority_score FLOAT NOT NULL DEFAULT 0.0,
+                    reserved_at DATETIME NOT NULL,
+                    expected_use_time DATETIME,
+                    expired_at DATETIME,
+                    confirmed_at DATETIME,
+                    confirmed_by VARCHAR(100),
+                    cancelled_at DATETIME,
+                    cancelled_by VARCHAR(100),
+                    cancel_reason TEXT,
+                    completed_at DATETIME,
+                    borrow_record_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    FOREIGN KEY (stool_id) REFERENCES stools (id),
+                    FOREIGN KEY (borrow_record_id) REFERENCES borrow_records (id)
+                )
+            """))
+            conn.execute(text("CREATE INDEX idx_reservations_stool_id ON reservations(stool_id)"))
+            conn.execute(text("CREATE INDEX idx_reservations_stool_number ON reservations(stool_number)"))
+            conn.execute(text("CREATE INDEX idx_reservations_storage_area ON reservations(storage_area)"))
+            conn.execute(text("CREATE INDEX idx_reservations_load_level ON reservations(load_level)"))
+            conn.execute(text("CREATE INDEX idx_reservations_applicant ON reservations(applicant)"))
+            conn.execute(text("CREATE INDEX idx_reservations_status ON reservations(status)"))
+            conn.execute(text("CREATE INDEX idx_reservations_queue_position ON reservations(queue_position)"))
+            conn.execute(text("CREATE INDEX idx_reservations_priority_score ON reservations(priority_score)"))
+            conn.execute(text("CREATE INDEX idx_reservations_borrow_record_id ON reservations(borrow_record_id)"))
+
+        if "reservation_logs" not in tables:
+            conn.execute(text("""
+                CREATE TABLE reservation_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_id INTEGER NOT NULL,
+                    action_type VARCHAR(50) NOT NULL,
+                    action_by VARCHAR(100) NOT NULL,
+                    action_at DATETIME NOT NULL,
+                    description TEXT,
+                    from_status VARCHAR(50),
+                    to_status VARCHAR(50),
+                    details TEXT,
+                    FOREIGN KEY (reservation_id) REFERENCES reservations (id)
+                )
+            """))
+            conn.execute(text("CREATE INDEX idx_reservation_logs_reservation_id ON reservation_logs(reservation_id)"))
 
 
 ensure_compatible_schema()
@@ -376,6 +445,91 @@ def api_restore_inspected_stool(data: RestoreInspectedStoolRequest, db: Session 
 def api_inspection_summary(db: Session = Depends(get_db)):
     summary = get_inspection_tasks_summary(db)
     return InspectionTaskSummary(**summary)
+
+
+@app.post("/api/reservations", response_model=ReservationResponse, tags=["预约管理"], summary="提交预约申请（使用人）")
+def api_create_reservation(data: CreateReservationRequest, db: Session = Depends(get_db)):
+    reservation = create_reservation(db, data)
+    return reservation
+
+
+@app.get("/api/reservations", response_model=ReservationListResponse, tags=["预约管理"], summary="查询预约列表")
+def api_list_reservations(
+    skip: int = Query(0, ge=0, description="跳过条数"),
+    limit: int = Query(100, ge=1, le=500, description="每页条数"),
+    stool_id: Optional[int] = Query(None, description="座凳ID筛选"),
+    storage_area: Optional[str] = Query(None, description="存放区域筛选（模糊匹配）"),
+    load_level: Optional[LoadLevel] = Query(None, description="承载等级筛选"),
+    applicant: Optional[str] = Query(None, description="预约人筛选（模糊匹配）"),
+    status: Optional[ReservationStatus] = Query(None, description="预约状态筛选"),
+    date_from: Optional[str] = Query(None, description="创建时间起（YYYY-MM-DD）"),
+    date_to: Optional[str] = Query(None, description="创建时间止（YYYY-MM-DD）"),
+    db: Session = Depends(get_db)
+):
+    dt_from = parse_datetime_param(date_from, "date_from")
+    dt_to = parse_datetime_param(date_to, "date_to")
+    if dt_to and date_to and len(date_to) == 10:
+        dt_to = dt_to.replace(hour=23, minute=59, second=59)
+
+    total, items = list_reservations(
+        db, skip, limit, stool_id, storage_area, load_level,
+        applicant, status, dt_from, dt_to
+    )
+    return ReservationListResponse(total=total, items=items)
+
+
+@app.get("/api/reservations/{reservation_id}", response_model=ReservationDetailResponse, tags=["预约管理"], summary="查询预约详情")
+def api_get_reservation(reservation_id: int, db: Session = Depends(get_db)):
+    reservation = get_reservation_detail(db, reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(reservation_id))
+    return ReservationDetailResponse.model_validate(reservation)
+
+
+@app.post("/api/reservations/cancel", response_model=ReservationResponse, tags=["预约管理"], summary="取消预约（使用人/管理者）")
+def api_cancel_reservation(data: CancelReservationRequest, db: Session = Depends(get_db)):
+    reservation = cancel_reservation(db, data)
+    return reservation
+
+
+@app.post("/api/reservations/confirm", response_model=ReservationResponse, tags=["预约管理"], summary="确认预约到场（值守人员）")
+def api_confirm_reservation(data: ConfirmReservationRequest, db: Session = Depends(get_db)):
+    reservation = confirm_reservation(db, data)
+    return reservation
+
+
+@app.post("/api/reservations/issue", response_model=BorrowRecordResponse, tags=["预约管理"], summary="通过预约发放座凳（值守人员）")
+def api_issue_by_reservation(data: IssueByReservationRequest, db: Session = Depends(get_db)):
+    record = issue_by_reservation(db, data)
+    enriched = enrich_records([record], db)[0]
+    return BorrowRecordResponse(**enriched)
+
+
+@app.post("/api/reservations/expire", tags=["预约管理"], summary="触发过期预约自动释放（系统/管理者）")
+def api_expire_reservations(db: Session = Depends(get_db)):
+    expired_count = expire_reservations(db)
+    return {
+        "message": f"成功处理 {expired_count} 条过期预约",
+        "expired_count": expired_count
+    }
+
+
+@app.get("/api/reservations/{reservation_id}/logs", tags=["预约管理"], summary="查询预约操作记录")
+def api_get_reservation_logs(reservation_id: int, db: Session = Depends(get_db)):
+    reservation = get_reservation(db, reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(reservation_id))
+    logs = get_reservation_logs(db, reservation_id)
+    return {
+        "total": len(logs),
+        "items": [ReservationLogResponse.model_validate(log) for log in logs]
+    }
+
+
+@app.get("/api/reservations/summary", response_model=ReservationSummary, tags=["预约管理"], summary="预约统计概览")
+def api_reservations_summary(db: Session = Depends(get_db)):
+    summary = get_reservations_summary(db)
+    return ReservationSummary(**summary)
 
 
 if __name__ == "__main__":

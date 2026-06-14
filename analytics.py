@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
-from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult
+from models import Stool, BorrowRecord, StoolStatus, LoadLevel, InspectionTask, InspectionTaskStatus, InspectionResult, Reservation, ReservationStatus
 from schemas import AlertItem, TurnoverDistributionItem, AbnormalAreaItem
 
 
@@ -278,6 +278,176 @@ def detect_inspection_detained_alerts(db: Session) -> List[AlertItem]:
     return alerts
 
 
+def detect_reservation_pending_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_4h = now - timedelta(hours=4)
+    threshold_12h = now - timedelta(hours=12)
+    threshold_24h = now - timedelta(hours=24)
+
+    pending_reservations = db.query(Reservation).filter(
+        Reservation.status == ReservationStatus.PENDING
+    ).all()
+
+    for res in pending_reservations:
+        hours_pending = round((now - res.reserved_at).total_seconds() / 3600, 1)
+        if hours_pending <= 0:
+            continue
+
+        if res.reserved_at <= threshold_24h:
+            severity = "high"
+        elif res.reserved_at <= threshold_12h:
+            severity = "medium"
+        elif res.reserved_at <= threshold_4h:
+            severity = "low"
+        else:
+            continue
+
+        alerts.append(AlertItem(
+            alert_type="预约待确认超时",
+            severity=severity,
+            message=f"座凳 {res.stool_number} 的预约申请已等待 {hours_pending} 小时未确认",
+            related_id=res.id,
+            related_stool_number=res.stool_number,
+            details={
+                "reservation_id": res.id,
+                "applicant": res.applicant,
+                "storage_area": res.storage_area,
+                "load_level": res.load_level.value,
+                "reserved_at": res.reserved_at.isoformat() if res.reserved_at else None,
+                "hours_pending": hours_pending,
+                "queue_position": res.queue_position,
+                "expected_use_time": res.expected_use_time.isoformat() if res.expected_use_time else None
+            }
+        ))
+    return alerts
+
+
+def detect_reservation_confirmed_not_issued_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_2h = now - timedelta(hours=2)
+    threshold_6h = now - timedelta(hours=6)
+    threshold_12h = now - timedelta(hours=12)
+
+    confirmed_reservations = db.query(Reservation).filter(
+        Reservation.status == ReservationStatus.CONFIRMED
+    ).all()
+
+    for res in confirmed_reservations:
+        if not res.confirmed_at:
+            continue
+        hours_confirmed = round((now - res.confirmed_at).total_seconds() / 3600, 1)
+        if hours_confirmed <= 0:
+            continue
+
+        if res.confirmed_at <= threshold_12h:
+            severity = "high"
+        elif res.confirmed_at <= threshold_6h:
+            severity = "medium"
+        elif res.confirmed_at <= threshold_2h:
+            severity = "low"
+        else:
+            continue
+
+        alerts.append(AlertItem(
+            alert_type="预约已确认未发放",
+            severity=severity,
+            message=f"座凳 {res.stool_number} 预约已确认 {hours_confirmed} 小时仍未发放",
+            related_id=res.id,
+            related_stool_number=res.stool_number,
+            details={
+                "reservation_id": res.id,
+                "applicant": res.applicant,
+                "storage_area": res.storage_area,
+                "load_level": res.load_level.value,
+                "confirmed_at": res.confirmed_at.isoformat() if res.confirmed_at else None,
+                "confirmed_by": res.confirmed_by,
+                "hours_confirmed": hours_confirmed,
+                "queue_position": res.queue_position
+            }
+        ))
+    return alerts
+
+
+def detect_reservation_queue_long_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+
+    area_queue_stats = db.query(
+        Reservation.storage_area,
+        func.count(Reservation.id).label("queue_count")
+    ).filter(
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    ).group_by(Reservation.storage_area).all()
+
+    for area, queue_count in area_queue_stats:
+        if queue_count >= 10:
+            severity = "high"
+        elif queue_count >= 5:
+            severity = "medium"
+        elif queue_count >= 3:
+            severity = "low"
+        else:
+            continue
+
+        alerts.append(AlertItem(
+            alert_type="预约排队过长",
+            severity=severity,
+            message=f"区域「{area}」当前有 {queue_count} 个预约正在排队",
+            details={
+                "storage_area": area,
+                "queue_count": queue_count,
+                "threshold_high": 10,
+                "threshold_medium": 5,
+                "threshold_low": 3
+            }
+        ))
+    return alerts
+
+
+def detect_stool_reserved_but_available_alerts(db: Session) -> List[AlertItem]:
+    alerts = []
+    now = datetime.utcnow()
+    threshold_1h = now - timedelta(hours=1)
+
+    reserved_available_stools = db.query(Stool).filter(
+        Stool.status == StoolStatus.RESERVED
+    ).all()
+
+    for stool in reserved_available_stools:
+        active_reservation = db.query(Reservation).filter(
+            Reservation.stool_id == stool.id,
+            Reservation.status == ReservationStatus.CONFIRMED
+        ).first()
+
+        if active_reservation and active_reservation.confirmed_at:
+            hours_since_confirm = round((now - active_reservation.confirmed_at).total_seconds() / 3600, 1)
+            if hours_since_confirm >= 1:
+                severity = "medium" if hours_since_confirm >= 3 else "low"
+                alerts.append(AlertItem(
+                    alert_type="已预约座凳未及时发放",
+                    severity=severity,
+                    message=f"座凳 {stool.stool_number} 已标记为预约状态 {hours_since_confirm} 小时未发放",
+                    related_id=active_reservation.id,
+                    related_stool_number=stool.stool_number,
+                    details={
+                        "stool_id": stool.id,
+                        "stool_number": stool.stool_number,
+                        "reservation_id": active_reservation.id,
+                        "applicant": active_reservation.applicant,
+                        "confirmed_at": active_reservation.confirmed_at.isoformat(),
+                        "confirmed_by": active_reservation.confirmed_by,
+                        "hours_since_confirm": hours_since_confirm
+                    }
+                ))
+
+    return alerts
+
+
 def get_all_alerts(db: Session, alert_type: Optional[str] = None, severity: Optional[str] = None) -> List[AlertItem]:
     all_alerts = []
     all_alerts.extend(detect_long_borrow_alerts(db))
@@ -287,6 +457,10 @@ def get_all_alerts(db: Session, alert_type: Optional[str] = None, severity: Opti
     all_alerts.extend(detect_inspection_overdue_alerts(db))
     all_alerts.extend(detect_inspection_pending_review_alerts(db))
     all_alerts.extend(detect_inspection_detained_alerts(db))
+    all_alerts.extend(detect_reservation_pending_alerts(db))
+    all_alerts.extend(detect_reservation_confirmed_not_issued_alerts(db))
+    all_alerts.extend(detect_reservation_queue_long_alerts(db))
+    all_alerts.extend(detect_stool_reserved_but_available_alerts(db))
 
     if alert_type:
         all_alerts = [a for a in all_alerts if a.alert_type == alert_type]

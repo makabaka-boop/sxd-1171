@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
-from models import StoolStatus, LoadLevel, InspectionTaskStatus, InspectionResult
+from models import StoolStatus, LoadLevel, InspectionTaskStatus, InspectionResult, ReservationStatus
 
 
 class StoolBase(BaseModel):
@@ -106,6 +106,7 @@ class BorrowRecordResponse(BaseModel):
     turnover_hours: Optional[float] = None
     source_type: str = "借还流程"
     source_task_id: Optional[int] = None
+    source_reservation_id: Optional[int] = None
     created_at: datetime
 
     class Config:
@@ -272,3 +273,94 @@ class InspectionTaskSummary(BaseModel):
     abnormal_detained_count: int
     abnormal_pending_review_count: int
     closed_count: int
+
+
+class CreateReservationRequest(BaseModel):
+    stool_id: int = Field(..., description="座凳ID")
+    applicant: str = Field(..., min_length=1, max_length=100, description="预约使用人")
+    applicant_contact: Optional[str] = Field(None, max_length=100, description="联系方式")
+    purpose: Optional[str] = Field(None, description="使用用途")
+    expected_use_time: Optional[datetime] = Field(None, description="期望使用时间")
+
+
+class CancelReservationRequest(BaseModel):
+    reservation_id: int = Field(..., description="预约ID")
+    cancelled_by: str = Field(..., min_length=1, max_length=100, description="取消操作人")
+    cancel_reason: Optional[str] = Field(None, description="取消原因")
+
+
+class ConfirmReservationRequest(BaseModel):
+    reservation_id: int = Field(..., description="预约ID")
+    confirmed_by: str = Field(..., min_length=1, max_length=100, description="确认操作人（值守人员）")
+    borrower: Optional[str] = Field(None, max_length=100, description="借用人（默认使用预约人）")
+    borrower_contact: Optional[str] = Field(None, max_length=100, description="借用人联系方式")
+
+
+class ReservationLogResponse(BaseModel):
+    id: int
+    reservation_id: int
+    action_type: str
+    action_by: str
+    action_at: datetime
+    description: Optional[str] = None
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    details: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ReservationResponse(BaseModel):
+    id: int
+    stool_id: int
+    stool_number: str
+    storage_area: str
+    load_level: LoadLevel
+    applicant: str
+    applicant_contact: Optional[str] = None
+    purpose: Optional[str] = None
+    status: ReservationStatus
+    queue_position: Optional[int] = None
+    priority_score: float
+    reserved_at: datetime
+    expected_use_time: Optional[datetime] = None
+    expired_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    confirmed_by: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+    cancelled_by: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    completed_at: Optional[datetime] = None
+    borrow_record_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReservationDetailResponse(ReservationResponse):
+    logs: List[ReservationLogResponse] = []
+
+
+class ReservationListResponse(BaseModel):
+    total: int
+    items: List[ReservationResponse]
+
+
+class ReservationSummary(BaseModel):
+    total_reservations: int
+    pending_count: int
+    confirmed_count: int
+    cancelled_count: int
+    expired_count: int
+    completed_count: int
+    total_queue_count: int
+
+
+class IssueByReservationRequest(BaseModel):
+    reservation_id: int = Field(..., description="预约ID")
+    issued_by: str = Field(..., min_length=1, max_length=100, description="发放操作人（值守人员）")
+    borrower: Optional[str] = Field(None, max_length=100, description="借用人（默认使用预约人）")
+    borrower_contact: Optional[str] = Field(None, max_length=100, description="借用人联系方式")

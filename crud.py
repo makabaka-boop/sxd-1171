@@ -7,14 +7,16 @@ from sqlalchemy import func, and_, or_
 from models import (
     Stool, BorrowRecord, StoolStatus, LoadLevel,
     InspectionTask, InspectionTaskStatus, InspectionResult,
-    InspectionTaskLog
+    InspectionTaskLog, Reservation, ReservationStatus, ReservationLog
 )
 from schemas import (
     StoolCreate, StoolUpdate,
     IssueStoolRequest, ReturnStoolRequest,
     CleanStoolRequest, ReviewStoolRequest, DetainStoolRequest,
     GenerateInspectionTasksRequest, SubmitInspectionResultRequest,
-    ReviewInspectionTaskRequest, RestoreInspectedStoolRequest
+    ReviewInspectionTaskRequest, RestoreInspectedStoolRequest,
+    CreateReservationRequest, CancelReservationRequest,
+    ConfirmReservationRequest, IssueByReservationRequest
 )
 from exceptions import ValidationException, StatusConflictException, NotFoundException
 
@@ -108,6 +110,13 @@ def update_stool(db: Session, stool_id: int, data: StoolUpdate) -> Stool:
                 expected_status="通过正常借还流程更新状态"
             )
 
+        if current_status == StoolStatus.RESERVED:
+            raise StatusConflictException(
+                f"座凳正处于「{current_status.value}」状态，存在活跃预约，不可直接修改状态",
+                current_status=current_status.value,
+                expected_status="通过预约发放/取消流程更新状态"
+            )
+
         if new_status == StoolStatus.RESTORED:
             latest_record = db.query(BorrowRecord).filter(
                 BorrowRecord.stool_id == stool_id
@@ -118,6 +127,13 @@ def update_stool(db: Session, stool_id: int, data: StoolUpdate) -> Stool:
                     current_status=current_status.value,
                     expected_status="通过复核流程完成后自动更新"
                 )
+
+        if new_status == StoolStatus.RESERVED:
+            raise StatusConflictException(
+                "不可直接将座凳标记为已预约状态，请通过预约流程创建预约",
+                current_status=current_status.value,
+                expected_status="使用 /api/reservations 接口创建预约"
+            )
 
         valid_direct_changes = {
             (StoolStatus.PENDING_ISSUE, StoolStatus.RESTORED): True,
@@ -157,6 +173,13 @@ def delete_stool(db: Session, stool_id: int):
             current_status=stool.status.value,
             expected_status="无活跃借出"
         )
+    active_reservation = get_active_reservation_for_stool(db, stool_id)
+    if active_reservation:
+        raise StatusConflictException(
+            f"座凳存在活跃预约（预约ID：{active_reservation.id}），无法删除",
+            current_status=stool.status.value,
+            expected_status="先取消或完成预约"
+        )
     db.delete(stool)
     db.commit()
 
@@ -172,6 +195,15 @@ def issue_stool(db: Session, data: IssueStoolRequest) -> BorrowRecord:
             current_status=stool.status.value,
             expected_status=f"{StoolStatus.PENDING_ISSUE.value} 或 {StoolStatus.RESTORED.value}"
         )
+
+    if stool.status == StoolStatus.RESERVED:
+        active_reservation = get_active_reservation_for_stool(db, data.stool_id)
+        if active_reservation:
+            raise StatusConflictException(
+                f"座凳 {stool.stool_number} 已被预约（预约ID：{active_reservation.id}），请通过预约发放流程处理",
+                current_status=stool.status.value,
+                expected_status="使用 /api/reservations/issue 接口发放"
+            )
 
     if stool.status == StoolStatus.BORROWED:
         active = db.query(BorrowRecord).filter(
@@ -190,6 +222,14 @@ def issue_stool(db: Session, data: IssueStoolRequest) -> BorrowRecord:
             f"座凳当前状态为 {stool.status.value}，不可发放",
             current_status=stool.status.value,
             expected_status=f"{StoolStatus.PENDING_ISSUE.value} 或 {StoolStatus.RESTORED.value}"
+        )
+
+    active_reservation = get_active_reservation_for_stool(db, data.stool_id)
+    if active_reservation:
+        raise StatusConflictException(
+            f"座凳 {stool.stool_number} 存在待处理的预约申请（预约ID：{active_reservation.id}），请优先处理预约或取消预约后再发放",
+            current_status=stool.status.value,
+            expected_status="先处理预约申请"
         )
 
     latest_record = db.query(BorrowRecord).filter(
@@ -394,7 +434,24 @@ def review_stool(db: Session, data: ReviewStoolRequest) -> BorrowRecord:
         record.review_note = data.review_note.strip()
 
     if data.review_result == "恢复可用":
-        stool.status = StoolStatus.RESTORED
+        next_reservation = get_active_reservation_for_stool(db, record.stool_id)
+        if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+            stool.status = StoolStatus.RESERVED
+            next_reservation.status = ReservationStatus.CONFIRMED
+            next_reservation.confirmed_at = now
+            next_reservation.confirmed_by = data.reviewed_by.strip()
+            add_reservation_log(
+                db, next_reservation.id, "自动递补确认", data.reviewed_by.strip(),
+                description="座凳复核完成恢复可用，排队预约自动递补确认",
+                from_status=ReservationStatus.PENDING.value,
+                to_status=ReservationStatus.CONFIRMED.value,
+                details={
+                    "stool_number": stool.stool_number,
+                    "review_record_id": record.id
+                }
+            )
+        else:
+            stool.status = StoolStatus.RESTORED
     elif data.review_result == "需留置":
         stool.status = StoolStatus.DETAINED
         record.is_detained = 1
@@ -510,6 +567,8 @@ def enrich_records(records: List[BorrowRecord], db: Session) -> List[dict]:
         stool = get_stool(db, r.stool_id)
         if stool:
             enriched["stool_number"] = stool.stool_number
+        if r.source_reservation_id:
+            enriched["source_reservation_id"] = r.source_reservation_id
         result.append(enriched)
     return result
 
@@ -560,7 +619,8 @@ def generate_inspection_tasks(db: Session, source_type: str = "周期巡检") ->
     stools = db.query(Stool).filter(
         Stool.status.in_([
             StoolStatus.PENDING_ISSUE,
-            StoolStatus.RESTORED
+            StoolStatus.RESTORED,
+            StoolStatus.RESERVED
         ])
     ).all()
 
@@ -884,16 +944,39 @@ def restore_inspected_stool(db: Session, data: RestoreInspectedStoolRequest) -> 
     task.task_status = InspectionTaskStatus.CLOSED
     task.updated_at = now
 
-    stool.status = StoolStatus.RESTORED
+    next_reservation = get_active_reservation_for_stool(db, task.stool_id)
+    if next_reservation and next_reservation.status == ReservationStatus.PENDING:
+        stool.status = StoolStatus.RESERVED
+        next_reservation.status = ReservationStatus.CONFIRMED
+        next_reservation.confirmed_at = now
+        next_reservation.confirmed_by = data.restored_by.strip()
+        add_reservation_log(
+            db, next_reservation.id, "自动递补确认", data.restored_by.strip(),
+            description="座凳巡检异常留置解除恢复可用，排队预约自动递补确认",
+            from_status=ReservationStatus.PENDING.value,
+            to_status=ReservationStatus.CONFIRMED.value,
+            details={
+                "stool_number": stool.stool_number,
+                "inspection_task_id": task.id
+            }
+        )
+        add_inspection_log(
+            db, task.id, "恢复可用", data.restored_by,
+            description=f"座凳恢复可用，已有排队预约（ID：{next_reservation.id}）自动递补确认",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.CLOSED.value,
+            details={"restore_note": data.restore_note, "reservation_id": next_reservation.id}
+        )
+    else:
+        stool.status = StoolStatus.RESTORED
+        add_inspection_log(
+            db, task.id, "恢复可用", data.restored_by,
+            description=f"座凳恢复可用状态，备注：{data.restore_note or '无'}",
+            from_status=old_status.value,
+            to_status=InspectionTaskStatus.CLOSED.value,
+            details={"restore_note": data.restore_note}
+        )
     stool.updated_at = now
-
-    add_inspection_log(
-        db, task.id, "恢复可用", data.restored_by,
-        description=f"座凳恢复可用状态，备注：{data.restore_note or '无'}",
-        from_status=old_status.value,
-        to_status=InspectionTaskStatus.CLOSED.value,
-        details={"restore_note": data.restore_note}
-    )
 
     db.commit()
     db.refresh(task)
@@ -939,3 +1022,547 @@ def get_inspection_tasks_summary(db: Session) -> dict:
         ).count(),
     }
     return summary
+
+
+RESERVATION_EXPIRE_HOURS = 24
+PRIORITY_WEIGHT_TIME = 1.0
+PRIORITY_WEIGHT_LOAD = 0.5
+
+
+def add_reservation_log(
+    db: Session,
+    reservation_id: int,
+    action_type: str,
+    action_by: str,
+    description: str = None,
+    from_status: str = None,
+    to_status: str = None,
+    details: dict = None
+) -> ReservationLog:
+    log = ReservationLog(
+        reservation_id=reservation_id,
+        action_type=action_type,
+        action_by=action_by.strip(),
+        description=description,
+        from_status=from_status,
+        to_status=to_status,
+        details=json.dumps(details, ensure_ascii=False) if details else None
+    )
+    db.add(log)
+    db.flush()
+    return log
+
+
+def calculate_priority_score(
+    db: Session,
+    stool: Stool,
+    expected_use_time: Optional[datetime] = None
+) -> float:
+    score = 0.0
+
+    now = datetime.utcnow()
+    if expected_use_time:
+        time_diff = abs((expected_use_time - now).total_seconds() / 3600)
+        score += PRIORITY_WEIGHT_TIME * max(0, 72 - time_diff) / 72
+    else:
+        score += PRIORITY_WEIGHT_TIME * 0.5
+
+    load_priority = {
+        LoadLevel.LIGHT: 0.2,
+        LoadLevel.MEDIUM: 0.5,
+        LoadLevel.HEAVY: 0.8,
+        LoadLevel.EXTRA_HEAVY: 1.0
+    }
+    score += PRIORITY_WEIGHT_LOAD * load_priority.get(stool.load_level, 0.5)
+
+    return round(score, 4)
+
+
+def update_queue_positions(
+    db: Session,
+    storage_area: str = None,
+    load_level: LoadLevel = None
+):
+    query = db.query(Reservation).filter(
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    )
+
+    if storage_area:
+        query = query.filter(Reservation.storage_area == storage_area)
+    if load_level:
+        query = query.filter(Reservation.load_level == load_level)
+
+    reservations = query.order_by(
+        Reservation.priority_score.desc(),
+        Reservation.reserved_at.asc()
+    ).all()
+
+    for idx, res in enumerate(reservations, start=1):
+        res.queue_position = idx
+
+    db.flush()
+
+
+def get_active_reservation_for_stool(
+    db: Session,
+    stool_id: int
+) -> Optional[Reservation]:
+    return db.query(Reservation).filter(
+        Reservation.stool_id == stool_id,
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    ).order_by(
+        Reservation.priority_score.desc(),
+        Reservation.reserved_at.asc()
+    ).first()
+
+
+def has_active_reservation(db: Session, stool_id: int) -> bool:
+    return get_active_reservation_for_stool(db, stool_id) is not None
+
+
+def create_reservation(
+    db: Session,
+    data: CreateReservationRequest
+) -> Reservation:
+    stool = get_stool(db, data.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(data.stool_id))
+
+    if stool.status == StoolStatus.DETAINED:
+        raise StatusConflictException(
+            "座凳已被异常留置，不可预约",
+            current_status=stool.status.value,
+            expected_status="非留置状态"
+        )
+
+    if stool.status in [StoolStatus.PENDING_ISSUE, StoolStatus.RESTORED]:
+        raise StatusConflictException(
+            "座凳当前可直接借用，无需预约",
+            current_status=stool.status.value,
+            expected_status="已借出/清洁/复核/巡检中状态"
+        )
+
+    existing_pending = db.query(Reservation).filter(
+        Reservation.stool_id == data.stool_id,
+        Reservation.applicant == data.applicant.strip(),
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    ).first()
+    if existing_pending:
+        raise ValidationException(
+            f"您已针对该座凳提交过预约申请（预约ID：{existing_pending.id}），不可重复预约",
+            "applicant"
+        )
+
+    priority_score = calculate_priority_score(
+        db, stool, data.expected_use_time
+    )
+
+    now = datetime.utcnow()
+    expired_at = now + timedelta(hours=RESERVATION_EXPIRE_HOURS)
+
+    reservation = Reservation(
+        stool_id=stool.id,
+        stool_number=stool.stool_number,
+        storage_area=stool.storage_area,
+        load_level=stool.load_level,
+        applicant=data.applicant.strip(),
+        applicant_contact=data.applicant_contact.strip() if data.applicant_contact else None,
+        purpose=data.purpose.strip() if data.purpose else None,
+        status=ReservationStatus.PENDING,
+        priority_score=priority_score,
+        reserved_at=now,
+        expected_use_time=data.expected_use_time,
+        expired_at=expired_at
+    )
+    db.add(reservation)
+    db.flush()
+
+    add_reservation_log(
+        db, reservation.id, "提交预约", data.applicant.strip(),
+        description=f"预约座凳 {stool.stool_number}",
+        from_status=None,
+        to_status=ReservationStatus.PENDING.value,
+        details={
+            "stool_number": stool.stool_number,
+            "storage_area": stool.storage_area,
+            "load_level": stool.load_level.value,
+            "purpose": data.purpose,
+            "expected_use_time": data.expected_use_time.isoformat() if data.expected_use_time else None,
+            "priority_score": priority_score
+        }
+    )
+
+    update_queue_positions(db, stool.storage_area, stool.load_level)
+
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+
+def get_reservation(
+    db: Session,
+    reservation_id: int
+) -> Optional[Reservation]:
+    return db.query(Reservation).filter(Reservation.id == reservation_id).first()
+
+
+def get_reservation_detail(
+    db: Session,
+    reservation_id: int
+) -> Optional[Reservation]:
+    reservation = db.query(Reservation).filter(Reservation.id == reservation_id).first()
+    if reservation:
+        _ = reservation.logs
+    return reservation
+
+
+def list_reservations(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    stool_id: Optional[int] = None,
+    storage_area: Optional[str] = None,
+    load_level: Optional[LoadLevel] = None,
+    applicant: Optional[str] = None,
+    status: Optional[ReservationStatus] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None
+):
+    query = db.query(Reservation)
+
+    if stool_id:
+        query = query.filter(Reservation.stool_id == stool_id)
+    if storage_area:
+        query = query.filter(Reservation.storage_area.like(f"%{storage_area}%"))
+    if load_level:
+        query = query.filter(Reservation.load_level == load_level)
+    if applicant:
+        query = query.filter(Reservation.applicant.like(f"%{applicant}%"))
+    if status:
+        query = query.filter(Reservation.status == status)
+    if date_from:
+        query = query.filter(Reservation.created_at >= date_from)
+    if date_to:
+        query = query.filter(Reservation.created_at <= date_to)
+
+    total = query.count()
+    items = query.order_by(
+        Reservation.priority_score.desc(),
+        Reservation.reserved_at.asc()
+    ).offset(skip).limit(limit).all()
+
+    return total, items
+
+
+def cancel_reservation(
+    db: Session,
+    data: CancelReservationRequest
+) -> Reservation:
+    reservation = get_reservation(db, data.reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(data.reservation_id))
+
+    if reservation.status not in [
+        ReservationStatus.PENDING,
+        ReservationStatus.CONFIRMED
+    ]:
+        raise StatusConflictException(
+            f"预约当前状态为「{reservation.status.value}」，不可取消",
+            current_status=reservation.status.value,
+            expected_status=f"{ReservationStatus.PENDING.value} 或 {ReservationStatus.CONFIRMED.value}"
+        )
+
+    old_status = reservation.status
+    now = datetime.utcnow()
+
+    reservation.status = ReservationStatus.CANCELLED
+    reservation.cancelled_at = now
+    reservation.cancelled_by = data.cancelled_by.strip()
+    reservation.cancel_reason = data.cancel_reason.strip() if data.cancel_reason else None
+    reservation.queue_position = None
+
+    add_reservation_log(
+        db, reservation.id, "取消预约", data.cancelled_by.strip(),
+        description=data.cancel_reason or "用户主动取消预约",
+        from_status=old_status.value,
+        to_status=ReservationStatus.CANCELLED.value,
+        details={
+            "cancel_reason": data.cancel_reason,
+            "stool_number": reservation.stool_number
+        }
+    )
+
+    update_queue_positions(db, reservation.storage_area, reservation.load_level)
+
+    stool = get_stool(db, reservation.stool_id)
+    if stool and stool.status == StoolStatus.RESERVED:
+        next_reservation = get_active_reservation_for_stool(db, reservation.stool_id)
+        if not next_reservation:
+            if has_pending_cleaning_or_review(db, reservation.stool_id):
+                pass
+            else:
+                stool.status = StoolStatus.RESTORED
+                stool.updated_at = now
+
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+
+def has_pending_cleaning_or_review(db: Session, stool_id: int) -> bool:
+    latest_record = db.query(BorrowRecord).filter(
+        BorrowRecord.stool_id == stool_id
+    ).order_by(BorrowRecord.created_at.desc()).first()
+
+    if not latest_record:
+        return False
+
+    if latest_record.returned_at and not latest_record.cleaned_at:
+        return True
+    if latest_record.cleaned_at and not latest_record.reviewed_at and latest_record.is_detained == 0:
+        return True
+
+    return False
+
+
+def confirm_reservation(
+    db: Session,
+    data: ConfirmReservationRequest
+) -> Reservation:
+    reservation = get_reservation(db, data.reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(data.reservation_id))
+
+    if reservation.status != ReservationStatus.PENDING:
+        raise StatusConflictException(
+            f"预约当前状态为「{reservation.status.value}」，不可确认",
+            current_status=reservation.status.value,
+            expected_status=ReservationStatus.PENDING.value
+        )
+
+    stool = get_stool(db, reservation.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(reservation.stool_id))
+
+    if stool.status not in [StoolStatus.PENDING_ISSUE, StoolStatus.RESTORED, StoolStatus.RESERVED]:
+        raise StatusConflictException(
+            f"座凳当前状态为「{stool.status.value}」，不可确认预约",
+            current_status=stool.status.value,
+            expected_status=f"{StoolStatus.PENDING_ISSUE.value} 或 {StoolStatus.RESTORED.value}"
+        )
+
+    old_status = reservation.status
+    now = datetime.utcnow()
+
+    reservation.status = ReservationStatus.CONFIRMED
+    reservation.confirmed_at = now
+    reservation.confirmed_by = data.confirmed_by.strip()
+
+    stool.status = StoolStatus.RESERVED
+    stool.updated_at = now
+
+    add_reservation_log(
+        db, reservation.id, "确认预约", data.confirmed_by.strip(),
+        description=f"确认预约人 {reservation.applicant} 已到场，座凳标记为已预约",
+        from_status=old_status.value,
+        to_status=ReservationStatus.CONFIRMED.value,
+        details={
+            "stool_number": reservation.stool_number,
+            "applicant": reservation.applicant,
+            "borrower": data.borrower,
+            "borrower_contact": data.borrower_contact
+        }
+    )
+
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+
+def issue_by_reservation(
+    db: Session,
+    data: IssueByReservationRequest
+) -> BorrowRecord:
+    reservation = get_reservation(db, data.reservation_id)
+    if not reservation:
+        raise NotFoundException("预约记录", str(data.reservation_id))
+
+    if reservation.status != ReservationStatus.CONFIRMED:
+        raise StatusConflictException(
+            f"预约当前状态为「{reservation.status.value}」，不可发放",
+            current_status=reservation.status.value,
+            expected_status=ReservationStatus.CONFIRMED.value
+        )
+
+    stool = get_stool(db, reservation.stool_id)
+    if not stool:
+        raise NotFoundException("座凳", str(reservation.stool_id))
+
+    if stool.status != StoolStatus.RESERVED:
+        raise StatusConflictException(
+            f"座凳当前状态为「{stool.status.value}」，不可发放",
+            current_status=stool.status.value,
+            expected_status=StoolStatus.RESERVED.value
+        )
+
+    borrower = data.borrower.strip() if data.borrower else reservation.applicant
+    borrower_contact = data.borrower_contact.strip() if data.borrower_contact else reservation.applicant_contact
+
+    now = datetime.utcnow()
+    record = BorrowRecord(
+        stool_id=stool.id,
+        borrower=borrower,
+        borrower_contact=borrower_contact,
+        issued_at=now,
+        issued_by=data.issued_by.strip(),
+        source_type="预约发放",
+        source_reservation_id=reservation.id
+    )
+    db.add(record)
+    db.flush()
+
+    reservation.status = ReservationStatus.COMPLETED
+    reservation.completed_at = now
+    reservation.borrow_record_id = record.id
+    reservation.queue_position = None
+
+    stool.status = StoolStatus.BORROWED
+    stool.updated_at = now
+
+    add_reservation_log(
+        db, reservation.id, "发放座凳", data.issued_by.strip(),
+        description=f"预约完成，座凳已发放给 {borrower}",
+        from_status=ReservationStatus.CONFIRMED.value,
+        to_status=ReservationStatus.COMPLETED.value,
+        details={
+            "stool_number": stool.stool_number,
+            "borrower": borrower,
+            "borrow_record_id": record.id
+        }
+    )
+
+    update_queue_positions(db, reservation.storage_area, reservation.load_level)
+
+    db.commit()
+    db.refresh(record)
+    db.refresh(reservation)
+    return record
+
+
+def expire_reservations(db: Session) -> int:
+    now = datetime.utcnow()
+    expired_count = 0
+
+    expired_reservations = db.query(Reservation).filter(
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ]),
+        Reservation.expired_at <= now
+    ).all()
+
+    for reservation in expired_reservations:
+        old_status = reservation.status
+        reservation.status = ReservationStatus.EXPIRED
+        reservation.queue_position = None
+
+        add_reservation_log(
+            db, reservation.id, "自动过期", "system",
+            description=f"预约超过 {RESERVATION_EXPIRE_HOURS} 小时未处理，自动失效",
+            from_status=old_status.value,
+            to_status=ReservationStatus.EXPIRED.value,
+            details={
+                "stool_number": reservation.stool_number,
+                "expired_at": reservation.expired_at.isoformat() if reservation.expired_at else None
+            }
+        )
+
+        stool = get_stool(db, reservation.stool_id)
+        if stool and stool.status == StoolStatus.RESERVED:
+            next_reservation = get_active_reservation_for_stool(db, reservation.stool_id)
+            if next_reservation:
+                next_reservation.status = ReservationStatus.CONFIRMED
+                next_reservation.confirmed_at = now
+                next_reservation.confirmed_by = "system"
+                add_reservation_log(
+                    db, next_reservation.id, "自动递补确认", "system",
+                    description=f"上一预约过期，排队自动递补",
+                    from_status=ReservationStatus.PENDING.value,
+                    to_status=ReservationStatus.CONFIRMED.value,
+                    details={"previous_reservation_id": reservation.id}
+                )
+            else:
+                if has_pending_cleaning_or_review(db, reservation.stool_id):
+                    pass
+                else:
+                    stool.status = StoolStatus.RESTORED
+                    stool.updated_at = now
+
+        expired_count += 1
+
+    if expired_count > 0:
+        update_queue_positions(db)
+        db.commit()
+
+    return expired_count
+
+
+def get_reservation_logs(
+    db: Session,
+    reservation_id: int
+) -> List[ReservationLog]:
+    return db.query(ReservationLog).filter(
+        ReservationLog.reservation_id == reservation_id
+    ).order_by(ReservationLog.action_at.asc()).all()
+
+
+def get_reservations_summary(db: Session) -> dict:
+    total_queue = db.query(Reservation).filter(
+        Reservation.status.in_([
+            ReservationStatus.PENDING,
+            ReservationStatus.CONFIRMED
+        ])
+    ).count()
+
+    summary = {
+        "total_reservations": db.query(Reservation).count(),
+        "pending_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.PENDING
+        ).count(),
+        "confirmed_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.CONFIRMED
+        ).count(),
+        "cancelled_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.CANCELLED
+        ).count(),
+        "expired_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.EXPIRED
+        ).count(),
+        "completed_count": db.query(Reservation).filter(
+            Reservation.status == ReservationStatus.COMPLETED
+        ).count(),
+        "total_queue_count": total_queue
+    }
+    return summary
+
+
+def enrich_reservation_records(
+    records: List[Reservation],
+    db: Session
+) -> List[dict]:
+    result = []
+    for r in records:
+        enriched = r.__dict__.copy()
+        if "_sa_instance_state" in enriched:
+            del enriched["_sa_instance_state"]
+        result.append(enriched)
+    return result
