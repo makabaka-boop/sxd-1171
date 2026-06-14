@@ -4,6 +4,7 @@ from fastapi import FastAPI, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from database import engine, get_db, Base
 from models import StoolStatus, LoadLevel, Stool, BorrowRecord, InspectionTaskStatus, InspectionResult
@@ -35,6 +36,18 @@ from analytics import (
 from exceptions import NotFoundException, ValidationException
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_compatible_schema():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(borrow_records)"))}
+        if "source_type" not in columns:
+            conn.execute(text("ALTER TABLE borrow_records ADD COLUMN source_type VARCHAR(50) DEFAULT '借还流程' NOT NULL"))
+        if "source_task_id" not in columns:
+            conn.execute(text("ALTER TABLE borrow_records ADD COLUMN source_task_id INTEGER"))
+
+
+ensure_compatible_schema()
 
 app = FastAPI(
     title="公共借阅角折叠座凳管理系统",

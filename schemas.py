@@ -104,6 +104,8 @@ class BorrowRecordResponse(BaseModel):
     detained_by: Optional[str] = None
 
     turnover_hours: Optional[float] = None
+    source_type: str = "借还流程"
+    source_task_id: Optional[int] = None
     created_at: datetime
 
     class Config:

@@ -13,6 +13,7 @@ class StoolStatus(str, enum.Enum):
     PENDING_REVIEW = "待复核"
     RESTORED = "恢复可用"
     DETAINED = "异常留置"
+    PENDING_INSPECTION = "待巡检"
     PENDING_INSPECTION_REVIEW = "待巡检复核"
 
 
@@ -92,6 +93,8 @@ class BorrowRecord(Base):
     detained_by = Column(String(100), nullable=True)
 
     turnover_hours = Column(Float, nullable=True)
+    source_type = Column(String(50), default="借还流程", nullable=False)
+    source_task_id = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

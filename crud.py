@@ -566,11 +566,10 @@ def generate_inspection_tasks(db: Session, source_type: str = "周期巡检") ->
 
     for stool in stools:
         last_inspected_at = get_last_inspection_time(db, stool.id)
-
-        if last_inspected_at:
-            next_inspection_date = last_inspected_at + timedelta(days=stool.inspection_cycle_days)
-            if next_inspection_date > now:
-                continue
+        inspection_base_time = last_inspected_at or stool.created_at
+        next_inspection_date = inspection_base_time + timedelta(days=stool.inspection_cycle_days)
+        if next_inspection_date > now:
+            continue
 
         pending_task = db.query(InspectionTask).filter(
             InspectionTask.stool_id == stool.id,
@@ -705,13 +704,29 @@ def submit_inspection_result(db: Session, data: SubmitInspectionResultRequest) -
         )
     else:
         abnormal_action = data.abnormal_action or "待复核"
+        issue_text = data.appearance_issue.strip() if data.appearance_issue else "巡检发现外观异常"
+        inspection_record = BorrowRecord(
+            stool_id=task.stool_id,
+            returned_at=now,
+            returned_by=data.inspected_by.strip(),
+            appearance_issue=issue_text,
+            appearance_issue_level=data.appearance_issue_level.strip() if data.appearance_issue_level else None,
+            source_type="巡检异常",
+            source_task_id=task.id,
+            created_at=now
+        )
+        db.add(inspection_record)
 
         if abnormal_action == "留置":
             task.task_status = InspectionTaskStatus.ABNORMAL_DETAINED
             task.is_detained = 1
             task.detained_at = now
             task.detained_by = data.inspected_by.strip()
-            task.detained_reason = f"巡检异常留置: {data.appearance_issue or '外观异常'}"
+            task.detained_reason = f"巡检异常留置: {issue_text}"
+            inspection_record.is_detained = 1
+            inspection_record.detained_at = now
+            inspection_record.detained_by = data.inspected_by.strip()
+            inspection_record.detained_reason = task.detained_reason
             stool.status = StoolStatus.DETAINED
 
             add_inspection_log(
@@ -822,7 +837,7 @@ def review_inspection_task(db: Session, data: ReviewInspectionTaskRequest) -> In
         task.reviewed_by = None
         task.review_result = None
         task.review_note = None
-        stool.status = StoolStatus.PENDING_INSPECTION_REVIEW
+        stool.status = StoolStatus.PENDING_INSPECTION
 
         add_inspection_log(
             db, task.id, "复核完成", data.reviewed_by,
